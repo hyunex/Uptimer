@@ -17,6 +17,7 @@ type Scenario = {
   name: string;
   monitorCount: number;
   withChannel: boolean;
+  recentHomepageAccess?: boolean;
 };
 
 type Sample = {
@@ -31,6 +32,12 @@ const OUTPUT_PATH = process.env.SCHEDULER_BENCH_OUTPUT ?? null;
 
 const SCENARIOS: Scenario[] = [
   { name: '1000 due monitors / no channels', monitorCount: 1000, withChannel: false },
+  {
+    name: '1000 due monitors / no channels / recent homepage access',
+    monitorCount: 1000,
+    withChannel: false,
+    recentHomepageAccess: true,
+  },
   { name: '5000 due monitors / no channels', monitorCount: 5000, withChannel: false },
   { name: '5000 due monitors / 1 webhook channel', monitorCount: 5000, withChannel: true },
 ];
@@ -49,15 +56,111 @@ function parsePositiveIntEnv(name: string, fallback: number): number {
 const WARMUP_RUNS = parsePositiveIntEnv('SCHEDULER_BENCH_WARMUPS', 3);
 const MEASURE_RUNS = parsePositiveIntEnv('SCHEDULER_BENCH_RUNS', 12);
 
+function serializePublicMonitorCache(cache: {
+  heartbeat: {
+    checked_at: number[];
+    status_codes: string;
+    latency_ms: Array<number | null>;
+  };
+  uptime_days: {
+    day_start_at: number[];
+    total_sec: number[];
+    downtime_sec: number[];
+    unknown_sec: number[];
+    uptime_sec: number[];
+  };
+}) {
+  return JSON.stringify(cache);
+}
+
+function serializeHomepageState(state: {
+  generated_at: number;
+  monitor_count_total: number;
+  site_title: string;
+  site_description: string;
+  site_locale: string;
+  site_timezone: string;
+  uptime_rating_level: number;
+  monitors: Array<{
+    id: number;
+    name: string;
+    type: 'http' | 'tcp';
+    group_name: string | null;
+    interval_sec: number;
+    created_at: number;
+    state_status: string;
+    last_checked_at: number | null;
+    covered_until_at: number;
+    cache: {
+      heartbeat: {
+        checked_at: number[];
+        status_codes: string;
+        latency_ms: Array<number | null>;
+      };
+      uptime_days: {
+        day_start_at: number[];
+        total_sec: number[];
+        downtime_sec: number[];
+        unknown_sec: number[];
+        uptime_sec: number[];
+      };
+    };
+  }>;
+  resolved_incident_preview: null;
+  maintenance_history_preview: null;
+}) {
+  return JSON.stringify({
+    v: 1,
+    g: state.generated_at,
+    c: state.monitor_count_total,
+    t: state.site_title,
+    d: state.site_description,
+    l: state.site_locale,
+    z: state.site_timezone,
+    r: state.uptime_rating_level,
+    m: state.monitors.map((monitor) => [
+      monitor.id,
+      monitor.name,
+      monitor.type === 'tcp' ? 't' : 'h',
+      monitor.group_name ?? '',
+      monitor.interval_sec,
+      monitor.created_at,
+      monitor.state_status === 'up'
+        ? 'u'
+        : monitor.state_status === 'down'
+          ? 'd'
+          : monitor.state_status === 'maintenance'
+            ? 'm'
+            : monitor.state_status === 'paused'
+              ? 'p'
+              : 'x',
+      monitor.last_checked_at ?? 0,
+      monitor.covered_until_at,
+      monitor.cache.heartbeat.checked_at,
+      monitor.cache.heartbeat.status_codes,
+      monitor.cache.heartbeat.latency_ms,
+      monitor.cache.uptime_days.day_start_at,
+      monitor.cache.uptime_days.total_sec,
+      monitor.cache.uptime_days.downtime_sec,
+      monitor.cache.uptime_days.unknown_sec,
+      monitor.cache.uptime_days.uptime_sec,
+    ]),
+    i: state.resolved_incident_preview,
+    w: state.maintenance_history_preview,
+  });
+}
+
 function makeDueRows(count: number) {
   return Array.from({ length: count }, (_, index) => ({
     id: index + 1,
     name: `Monitor ${index + 1}`,
     type: 'unsupported',
     target: `benchmark-target-${index + 1}`,
+    show_on_status_page: 1,
     group_name: index % 2 === 0 ? 'Core' : 'Edge',
     interval_sec: 60,
     created_at: 1_700_000_000 - 40 * 86_400,
+    last_checked_at: 1_700_000_000 - 60,
     timeout_ms: 5000,
     http_method: null,
     http_headers_json: null,
@@ -72,7 +175,50 @@ function makeDueRows(count: number) {
     last_changed_at: 1_700_000_000,
     consecutive_failures: 0,
     consecutive_successes: 3,
+    public_cache_json: serializePublicMonitorCache({
+      heartbeat: {
+        checked_at: Array.from({ length: 30 }, (_, heartbeatIndex) => 1_700_000_000 - (heartbeatIndex + 1) * 60),
+        status_codes: 'u'.repeat(30),
+        latency_ms: Array.from({ length: 30 }, (_, heartbeatIndex) => 40 + ((index + heartbeatIndex) % 50)),
+      },
+      uptime_days: {
+        day_start_at: Array.from({ length: 14 }, (_, dayIndex) => 1_700_000_000 - (14 - dayIndex) * 86_400),
+        total_sec: Array.from({ length: 14 }, () => 86_400),
+        downtime_sec: Array.from({ length: 14 }, () => 0),
+        unknown_sec: Array.from({ length: 14 }, () => 0),
+        uptime_sec: Array.from({ length: 14 }, () => 86_400),
+      },
+    }),
   }));
+}
+
+function buildHomepageStateJson(
+  dueRows: ReturnType<typeof makeDueRows>,
+  generatedAt: number,
+) {
+  return serializeHomepageState({
+    generated_at: generatedAt,
+    monitor_count_total: dueRows.length,
+    site_title: 'Status Hub',
+    site_description: 'Production services',
+    site_locale: 'en',
+    site_timezone: 'UTC',
+    uptime_rating_level: 3,
+    monitors: dueRows.map((row) => ({
+      id: row.id,
+      name: row.name,
+      type: row.type === 'tcp' ? 'tcp' : 'http',
+      group_name: row.group_name,
+      interval_sec: row.interval_sec,
+      created_at: row.created_at,
+      state_status: row.state_status,
+      last_checked_at: row.last_checked_at,
+      covered_until_at: generatedAt,
+      cache: JSON.parse(row.public_cache_json),
+    })),
+    resolved_incident_preview: null,
+    maintenance_history_preview: null,
+  });
 }
 
 function createEnvForScenario(scenario: Scenario): {
@@ -85,7 +231,12 @@ function createEnvForScenario(scenario: Scenario): {
     waitUntilCalls: 0,
   };
   const dueRows = makeDueRows(scenario.monitorCount);
-  let homepageArtifactGeneratedAt = 0;
+  let homepageGeneratedAt = scenario.recentHomepageAccess ? 1_700_000_000 - 60 : 0;
+  let homepageArtifactGeneratedAt = scenario.recentHomepageAccess ? 1_700_000_000 - 60 : 0;
+  let homepageStateGeneratedAt = scenario.recentHomepageAccess ? 1_700_000_000 - 60 : 0;
+  let homepageStateBodyJson = scenario.recentHomepageAccess
+    ? buildHomepageStateJson(dueRows, homepageStateGeneratedAt)
+    : '';
   const channels = scenario.withChannel
     ? [
         {
@@ -138,6 +289,10 @@ function createEnvForScenario(scenario: Scenario): {
       all: () => [],
     },
     {
+      match: 'from incidents',
+      all: () => [],
+    },
+    {
       match: 'from maintenance_window_monitors',
       all: () => [],
     },
@@ -180,13 +335,33 @@ function createEnvForScenario(scenario: Scenario): {
     },
     {
       match: 'from public_snapshots',
-      first: (args) =>
-        args[0] === 'homepage:artifact' && homepageArtifactGeneratedAt > 0
-          ? {
-              generated_at: homepageArtifactGeneratedAt,
-              body_json: '{"generated_at":0}',
-            }
-          : null,
+      first: (args) => {
+        if (args[0] === 'homepage:access' && scenario.recentHomepageAccess) {
+          return {
+            generated_at: 1_700_000_000,
+            body_json: '{}',
+          };
+        }
+        if (args[0] === 'homepage' && homepageGeneratedAt > 0) {
+          return {
+            generated_at: homepageGeneratedAt,
+            body_json: '{"generated_at":0}',
+          };
+        }
+        if (args[0] === 'homepage:artifact' && homepageArtifactGeneratedAt > 0) {
+          return {
+            generated_at: homepageArtifactGeneratedAt,
+            body_json: '{"generated_at":0}',
+          };
+        }
+        if (args[0] === 'homepage:state' && homepageStateGeneratedAt > 0) {
+          return {
+            generated_at: homepageStateGeneratedAt,
+            body_json: homepageStateBodyJson,
+          };
+        }
+        return null;
+      },
     },
     {
       match: 'insert into check_results',
@@ -207,8 +382,15 @@ function createEnvForScenario(scenario: Scenario): {
     {
       match: 'insert into public_snapshots',
       run: (args) => {
+        if (args[0] === 'homepage') {
+          homepageGeneratedAt = Number(args[1]);
+        }
         if (args[0] === 'homepage:artifact') {
           homepageArtifactGeneratedAt = Number(args[1]);
+        }
+        if (args[0] === 'homepage:state') {
+          homepageStateGeneratedAt = Number(args[1]);
+          homepageStateBodyJson = String(args[2]);
         }
         return { meta: { changes: 1 } };
       },

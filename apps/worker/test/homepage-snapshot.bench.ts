@@ -53,7 +53,7 @@ type RouteReadSample = {
 
 type HomepageHotPathScenario = {
   name: string;
-  mode: 'direct-homepage-compute';
+  mode: 'direct-homepage-compute' | 'state-snapshot-materialize';
   monitorCount: number;
 };
 
@@ -85,6 +85,16 @@ const ROUTE_READ_SCENARIOS: RouteReadScenario[] = [
 
 const HOMEPAGE_HOT_PATH_SCENARIOS: HomepageHotPathScenario[] = [
   {
+    name: 'homepage via state snapshot materialize / 250 monitors',
+    mode: 'state-snapshot-materialize',
+    monitorCount: 250,
+  },
+  {
+    name: 'homepage via state snapshot materialize / 1000 monitors',
+    mode: 'state-snapshot-materialize',
+    monitorCount: 1000,
+  },
+  {
     name: 'homepage via direct homepage compute / 250 monitors',
     mode: 'direct-homepage-compute',
     monitorCount: 250,
@@ -110,12 +120,148 @@ function parsePositiveIntEnv(name: string, fallback: number): number {
 const WARMUP_RUNS = parsePositiveIntEnv('HOMEPAGE_BENCH_WARMUPS', 3);
 const MEASURE_RUNS = parsePositiveIntEnv('HOMEPAGE_BENCH_RUNS', 12);
 
+function serializePublicMonitorCache(cache: {
+  heartbeat: {
+    checked_at: number[];
+    status_codes: string;
+    latency_ms: Array<number | null>;
+  };
+  uptime_days: {
+    day_start_at: number[];
+    total_sec: number[];
+    downtime_sec: number[];
+    unknown_sec: number[];
+    uptime_sec: number[];
+  };
+}) {
+  return JSON.stringify(cache);
+}
+
+function serializeHomepageState(state: {
+  generated_at: number;
+  monitor_count_total: number;
+  site_title: string;
+  site_description: string;
+  site_locale: string;
+  site_timezone: string;
+  uptime_rating_level: number;
+  monitors: Array<{
+    id: number;
+    name: string;
+    type: 'http' | 'tcp';
+    group_name: string | null;
+    interval_sec: number;
+    created_at: number;
+    state_status: string;
+    last_checked_at: number | null;
+    covered_until_at: number;
+    cache: {
+      heartbeat: {
+        checked_at: number[];
+        status_codes: string;
+        latency_ms: Array<number | null>;
+      };
+      uptime_days: {
+        day_start_at: number[];
+        total_sec: number[];
+        downtime_sec: number[];
+        unknown_sec: number[];
+        uptime_sec: number[];
+      };
+    };
+  }>;
+  resolved_incident_preview: null;
+  maintenance_history_preview: null;
+}) {
+  return JSON.stringify({
+    v: 1,
+    g: state.generated_at,
+    c: state.monitor_count_total,
+    t: state.site_title,
+    d: state.site_description,
+    l: state.site_locale,
+    z: state.site_timezone,
+    r: state.uptime_rating_level,
+    m: state.monitors.map((monitor) => [
+      monitor.id,
+      monitor.name,
+      monitor.type === 'tcp' ? 't' : 'h',
+      monitor.group_name ?? '',
+      monitor.interval_sec,
+      monitor.created_at,
+      monitor.state_status === 'up'
+        ? 'u'
+        : monitor.state_status === 'down'
+          ? 'd'
+          : monitor.state_status === 'maintenance'
+            ? 'm'
+            : monitor.state_status === 'paused'
+              ? 'p'
+              : 'x',
+      monitor.last_checked_at ?? 0,
+      monitor.covered_until_at,
+      monitor.cache.heartbeat.checked_at,
+      monitor.cache.heartbeat.status_codes,
+      monitor.cache.heartbeat.latency_ms,
+      monitor.cache.uptime_days.day_start_at,
+      monitor.cache.uptime_days.total_sec,
+      monitor.cache.uptime_days.downtime_sec,
+      monitor.cache.uptime_days.unknown_sec,
+      monitor.cache.uptime_days.uptime_sec,
+    ]),
+    i: state.resolved_incident_preview,
+    w: state.maintenance_history_preview,
+  });
+}
+
 const scenarioCache = new Map<string, ReturnType<typeof buildScenarioRows>>();
 
 function buildScenarioRows(scenario: Scenario, now: number) {
-  const monitors = Array.from({ length: scenario.monitorCount }, (_, index) => ({
-    id: index + 1,
-    name: `Monitor ${index + 1}`,
+  const monitorIds = Array.from({ length: scenario.monitorCount }, (_, index) => index + 1);
+
+  const heartbeats = monitorIds.flatMap((monitorId) =>
+    Array.from({ length: scenario.heartbeatPoints }, (_, index) => ({
+      monitor_id: monitorId,
+      checked_at: now - (index + 1) * 60,
+      status: 'up',
+      latency_ms: 40 + ((monitorId + index) % 50),
+    })),
+  );
+
+  const rollups = monitorIds.flatMap((monitorId) =>
+    Array.from({ length: scenario.uptimeDays }, (_, index) => ({
+      monitor_id: monitorId,
+      day_start_at: now - (scenario.uptimeDays - index) * 86_400,
+      total_sec: 86_400,
+      downtime_sec: 0,
+      unknown_sec: 0,
+      uptime_sec: 86_400,
+    })),
+  );
+
+  const heartbeatsByMonitorId = new Map<number, typeof heartbeats>();
+  for (const row of heartbeats) {
+    const existing = heartbeatsByMonitorId.get(row.monitor_id);
+    if (existing) {
+      existing.push(row);
+      continue;
+    }
+    heartbeatsByMonitorId.set(row.monitor_id, [row]);
+  }
+
+  const rollupsByMonitorId = new Map<number, typeof rollups>();
+  for (const row of rollups) {
+    const existing = rollupsByMonitorId.get(row.monitor_id);
+    if (existing) {
+      existing.push(row);
+      continue;
+    }
+    rollupsByMonitorId.set(row.monitor_id, [row]);
+  }
+
+  const monitors = monitorIds.map((id, index) => ({
+    id,
+    name: `Monitor ${id}`,
     type: 'http',
     group_name: index % 2 === 0 ? 'Core' : 'Edge',
     group_sort_order: index % 2,
@@ -125,27 +271,21 @@ function buildScenarioRows(scenario: Scenario, now: number) {
     state_status: 'up',
     last_checked_at: now - 30,
     last_latency_ms: 40 + (index % 50),
+    public_cache_json: serializePublicMonitorCache({
+      heartbeat: {
+        checked_at: (heartbeatsByMonitorId.get(id) ?? []).map((row) => row.checked_at),
+        status_codes: 'u'.repeat(scenario.heartbeatPoints),
+        latency_ms: (heartbeatsByMonitorId.get(id) ?? []).map((row) => row.latency_ms),
+      },
+      uptime_days: {
+        day_start_at: (rollupsByMonitorId.get(id) ?? []).map((row) => row.day_start_at),
+        total_sec: (rollupsByMonitorId.get(id) ?? []).map((row) => row.total_sec),
+        downtime_sec: (rollupsByMonitorId.get(id) ?? []).map((row) => row.downtime_sec),
+        unknown_sec: (rollupsByMonitorId.get(id) ?? []).map((row) => row.unknown_sec),
+        uptime_sec: (rollupsByMonitorId.get(id) ?? []).map((row) => row.uptime_sec),
+      },
+    }),
   }));
-
-  const heartbeats = monitors.flatMap((monitor) =>
-    Array.from({ length: scenario.heartbeatPoints }, (_, index) => ({
-      monitor_id: monitor.id,
-      checked_at: now - (index + 1) * 60,
-      status: 'up',
-      latency_ms: 40 + ((monitor.id + index) % 50),
-    })),
-  );
-
-  const rollups = monitors.flatMap((monitor) =>
-    Array.from({ length: scenario.uptimeDays }, (_, index) => ({
-      monitor_id: monitor.id,
-      day_start_at: now - (scenario.uptimeDays - index) * 86_400,
-      total_sec: 86_400,
-      downtime_sec: 0,
-      unknown_sec: 0,
-      uptime_sec: 86_400,
-    })),
-  );
 
   return { monitors, heartbeats, rollups };
 }
@@ -158,6 +298,82 @@ function getScenarioRows(scenario: Scenario, now: number) {
   const built = buildScenarioRows(scenario, now);
   scenarioCache.set(key, built);
   return built;
+}
+
+function buildHomepageStateSnapshotJson(scenario: Scenario, now: number): string {
+  const rows = getScenarioRows(scenario, now);
+  const heartbeatRowsByMonitorId = new Map<number, typeof rows.heartbeats>();
+  for (const row of rows.heartbeats) {
+    const existing = heartbeatRowsByMonitorId.get(row.monitor_id);
+    if (existing) {
+      existing.push(row);
+      continue;
+    }
+    heartbeatRowsByMonitorId.set(row.monitor_id, [row]);
+  }
+
+  const rollupRowsByMonitorId = new Map<number, typeof rows.rollups>();
+  for (const row of rows.rollups) {
+    const existing = rollupRowsByMonitorId.get(row.monitor_id);
+    if (existing) {
+      existing.push(row);
+      continue;
+    }
+    rollupRowsByMonitorId.set(row.monitor_id, [row]);
+  }
+
+  return serializeHomepageState({
+    generated_at: now - 60,
+    monitor_count_total: rows.monitors.length,
+    site_title: 'Status Hub',
+    site_description: 'Production services',
+    site_locale: 'en',
+    site_timezone: 'UTC',
+    uptime_rating_level: 3,
+    monitors: rows.monitors.map((row) => ({
+      id: row.id,
+      name: row.name,
+      type: row.type === 'tcp' ? 'tcp' : 'http',
+      group_name: row.group_name,
+      interval_sec: row.interval_sec,
+      created_at: row.created_at,
+      state_status: row.state_status,
+      last_checked_at: row.last_checked_at,
+      covered_until_at: now - 60,
+      cache: JSON.parse(
+        serializePublicMonitorCache({
+          heartbeat: {
+            checked_at: (heartbeatRowsByMonitorId.get(row.id) ?? []).map(
+              (heartbeatRow) => heartbeatRow.checked_at,
+            ),
+            status_codes: 'u'.repeat(scenario.heartbeatPoints),
+            latency_ms: (heartbeatRowsByMonitorId.get(row.id) ?? []).map(
+              (heartbeatRow) => heartbeatRow.latency_ms,
+            ),
+          },
+          uptime_days: {
+            day_start_at: (rollupRowsByMonitorId.get(row.id) ?? []).map(
+              (rollupRow) => rollupRow.day_start_at,
+            ),
+            total_sec: (rollupRowsByMonitorId.get(row.id) ?? []).map(
+              (rollupRow) => rollupRow.total_sec,
+            ),
+            downtime_sec: (rollupRowsByMonitorId.get(row.id) ?? []).map(
+              (rollupRow) => rollupRow.downtime_sec,
+            ),
+            unknown_sec: (rollupRowsByMonitorId.get(row.id) ?? []).map(
+              (rollupRow) => rollupRow.unknown_sec,
+            ),
+            uptime_sec: (rollupRowsByMonitorId.get(row.id) ?? []).map(
+              (rollupRow) => rollupRow.uptime_sec,
+            ),
+          },
+        }),
+      ),
+    })),
+    resolved_incident_preview: null,
+    maintenance_history_preview: null,
+  });
 }
 
 function createHandlersForScenario(scenario: Scenario, now: number): {
@@ -570,6 +786,7 @@ async function runOneHomepageHotPath(
       uptimeDays: 14,
     };
     const { handlers } = createHandlersForScenario(scenarioShape, now);
+    const homepageStateBodyJson = buildHomepageStateSnapshotJson(scenarioShape, now);
     const liveHandlers = [
       ...handlers,
       {
@@ -587,6 +804,12 @@ async function runOneHomepageHotPath(
               return {
                 generated_at: now,
                 body_json: JSON.stringify(artifact),
+              };
+            }
+            if (args[0] === 'homepage:state' && scenario.mode === 'state-snapshot-materialize') {
+              return {
+                generated_at: now - 60,
+                body_json: homepageStateBodyJson,
               };
             }
             return null;
