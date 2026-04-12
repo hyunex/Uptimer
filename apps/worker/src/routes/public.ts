@@ -162,9 +162,6 @@ publicRoutes.use(
   cachePublic({
     cacheName: 'uptimer-public',
     maxAgeSeconds: 30,
-    // Homepage payloads can be large; caching them via Cache API can add CPU due to body cloning.
-    // Prefer serving the precomputed D1 snapshot directly.
-    skipPathnames: ['/api/v1/public/homepage'],
   }),
 );
 
