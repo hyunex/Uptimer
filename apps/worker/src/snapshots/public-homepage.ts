@@ -10,6 +10,7 @@ const SNAPSHOT_ARTIFACT_KEY = 'homepage:artifact';
 const MAX_AGE_SECONDS = 60;
 const MAX_STALE_SECONDS = 10 * 60;
 const REFRESH_LOCK_NAME = 'snapshot:homepage:refresh';
+const REFRESH_DATA_SQL_LOCK_NAME = 'snapshot:homepage:data:refresh';
 const MAX_BOOTSTRAP_MONITORS = 12;
 
 const SPLIT_SNAPSHOT_VERSION = 3;
@@ -840,5 +841,607 @@ export async function refreshPublicHomepageArtifactSnapshotIfNeeded(opts: {
   }
 
   await refreshPublicHomepageArtifactSnapshot(opts);
+  return true;
+}
+
+type HomepageSnapshotSiteSettings = {
+  site_title: string;
+  site_description: string;
+  site_locale: 'auto' | 'en' | 'zh-CN' | 'zh-TW' | 'ja' | 'es';
+  site_timezone: string;
+  uptime_rating_level: 1 | 2 | 3 | 4 | 5;
+};
+
+const HOMEPAGE_DATA_SNAPSHOT_SQL = `
+  WITH
+    active_maintenance AS (
+      SELECT DISTINCT mwm.monitor_id
+      FROM maintenance_window_monitors mwm
+      JOIN maintenance_windows mw ON mw.id = mwm.maintenance_window_id
+      WHERE mw.starts_at <= ?1 AND mw.ends_at > ?1
+    ),
+    visible_monitors AS (
+      SELECT
+        m.id,
+        m.name,
+        m.type,
+        m.group_name,
+        m.group_sort_order,
+        m.sort_order,
+        m.interval_sec,
+        COALESCE(s.status, 'unknown') AS state_status,
+        s.last_checked_at,
+        CASE WHEN am.monitor_id IS NULL THEN 0 ELSE 1 END AS in_maintenance
+      FROM monitors m
+      LEFT JOIN monitor_state s ON s.monitor_id = m.id
+      LEFT JOIN active_maintenance am ON am.monitor_id = m.id
+      WHERE m.is_active = 1
+        AND m.show_on_status_page = 1
+    ),
+    presentation AS (
+      SELECT
+        vm.*,
+        CASE
+          WHEN in_maintenance = 1 OR state_status = 'maintenance' THEN 'maintenance'
+          WHEN state_status = 'paused' THEN 'paused'
+          WHEN state_status = 'down'
+            AND last_checked_at IS NOT NULL
+            AND ?1 - last_checked_at <= interval_sec * 2
+          THEN 'down'
+          WHEN state_status = 'up'
+            AND last_checked_at IS NOT NULL
+            AND ?1 - last_checked_at <= interval_sec * 2
+          THEN 'up'
+          ELSE 'unknown'
+        END AS status
+      FROM visible_monitors vm
+    ),
+    summary AS (
+      SELECT
+        COUNT(*) AS monitor_count_total,
+        COALESCE(SUM(status = 'up'), 0) AS up,
+        COALESCE(SUM(status = 'down'), 0) AS down,
+        COALESCE(SUM(status = 'maintenance'), 0) AS maintenance,
+        COALESCE(SUM(status = 'paused'), 0) AS paused,
+        COALESCE(SUM(status = 'unknown'), 0) AS unknown
+      FROM presentation
+    ),
+    overall AS (
+      SELECT
+        CASE
+          WHEN down > 0 THEN 'down'
+          WHEN unknown > 0 THEN 'unknown'
+          WHEN maintenance > 0 THEN 'maintenance'
+          WHEN up > 0 THEN 'up'
+          WHEN paused > 0 THEN 'paused'
+          ELSE 'unknown'
+        END AS overall_status
+      FROM summary
+    ),
+    hb_rows AS (
+      SELECT
+        cr.monitor_id,
+        cr.checked_at,
+        cr.latency_ms,
+        CASE cr.status
+          WHEN 'up' THEN 'u'
+          WHEN 'down' THEN 'd'
+          WHEN 'maintenance' THEN 'm'
+          ELSE 'x'
+        END AS code,
+        ROW_NUMBER() OVER (
+          PARTITION BY cr.monitor_id
+          ORDER BY cr.checked_at DESC, cr.id DESC
+        ) AS rn
+      FROM check_results cr
+      WHERE cr.monitor_id IN (SELECT id FROM presentation)
+    ),
+    hb AS (
+      SELECT
+        monitor_id,
+        json_group_array(checked_at) AS checked_at_json,
+        json_group_array(latency_ms) AS latency_json,
+        group_concat(code, '') AS status_codes
+      FROM (
+        SELECT monitor_id, checked_at, latency_ms, code
+        FROM hb_rows
+        WHERE rn <= 60
+        ORDER BY monitor_id, checked_at DESC, rn ASC
+      )
+      GROUP BY monitor_id
+    ),
+    rollup_range AS (
+      SELECT
+        (CAST(?1 / 86400 AS INTEGER) * 86400) AS end_day_start,
+        (CAST(?1 / 86400 AS INTEGER) * 86400) - (30 * 86400) AS start_day_start
+    ),
+    rollup_rows AS (
+      SELECT
+        r.monitor_id,
+        r.day_start_at,
+        r.downtime_sec,
+        r.unknown_sec,
+        CASE
+          WHEN r.total_sec > 0
+          THEN CAST(round((r.uptime_sec * 100000.0) / r.total_sec) AS INTEGER)
+          ELSE NULL
+        END AS uptime_pct_milli,
+        r.total_sec,
+        r.uptime_sec
+      FROM monitor_daily_rollups r
+      JOIN rollup_range rr
+      WHERE r.monitor_id IN (SELECT id FROM presentation)
+        AND r.day_start_at >= rr.start_day_start
+        AND r.day_start_at < rr.end_day_start
+    ),
+    rollup AS (
+      SELECT
+        monitor_id,
+        json_group_array(day_start_at) AS day_start_at_json,
+        json_group_array(downtime_sec) AS downtime_sec_json,
+        json_group_array(unknown_sec) AS unknown_sec_json,
+        json_group_array(uptime_pct_milli) AS uptime_pct_milli_json,
+        SUM(total_sec) AS total_sec_sum,
+        SUM(uptime_sec) AS uptime_sec_sum
+      FROM (
+        SELECT *
+        FROM rollup_rows
+        ORDER BY monitor_id, day_start_at
+      )
+      GROUP BY monitor_id
+    ),
+    monitor_cards AS (
+      SELECT
+        p.id,
+        json_object(
+          'id', p.id,
+          'name', p.name,
+          'type', CASE WHEN p.type = 'tcp' THEN 'tcp' ELSE 'http' END,
+          'group_name',
+            CASE
+              WHEN p.group_name IS NULL OR trim(p.group_name) = '' THEN NULL
+              ELSE trim(p.group_name)
+            END,
+          'status', p.status,
+          'is_stale',
+            CASE
+              WHEN p.in_maintenance = 1 OR p.state_status IN ('paused', 'maintenance')
+              THEN json('false')
+              WHEN p.last_checked_at IS NULL THEN json('true')
+              WHEN ?1 - p.last_checked_at > p.interval_sec * 2 THEN json('true')
+              ELSE json('false')
+            END,
+          'last_checked_at', p.last_checked_at,
+          'heartbeat_strip', json_object(
+            'checked_at', json(COALESCE(hb.checked_at_json, '[]')),
+            'status_codes', COALESCE(hb.status_codes, ''),
+            'latency_ms', json(COALESCE(hb.latency_json, '[]'))
+          ),
+          'uptime_30d',
+            CASE
+              WHEN rollup.total_sec_sum IS NULL OR rollup.total_sec_sum = 0 THEN NULL
+              ELSE json_object(
+                'uptime_pct',
+                  (rollup.uptime_sec_sum * 100.0) / rollup.total_sec_sum
+              )
+            END,
+          'uptime_day_strip', json_object(
+            'day_start_at', json(COALESCE(rollup.day_start_at_json, '[]')),
+            'downtime_sec', json(COALESCE(rollup.downtime_sec_json, '[]')),
+            'unknown_sec', json(COALESCE(rollup.unknown_sec_json, '[]')),
+            'uptime_pct_milli', json(COALESCE(rollup.uptime_pct_milli_json, '[]'))
+          )
+        ) AS monitor_json
+      FROM presentation p
+      LEFT JOIN hb ON hb.monitor_id = p.id
+      LEFT JOIN rollup ON rollup.monitor_id = p.id
+      ORDER BY
+        p.group_sort_order ASC,
+        lower(
+          CASE
+            WHEN p.group_name IS NULL OR trim(p.group_name) = '' THEN 'Ungrouped'
+            ELSE trim(p.group_name)
+          END
+        ) ASC,
+        p.sort_order ASC,
+        p.id ASC
+    ),
+    monitors_json AS (
+      SELECT json_group_array(json(monitor_json)) AS monitors
+      FROM monitor_cards
+    ),
+    visible_active_incidents AS (
+      SELECT
+        id,
+        title,
+        status,
+        impact,
+        message,
+        started_at,
+        resolved_at,
+        CASE impact
+          WHEN 'critical' THEN 3
+          WHEN 'major' THEN 2
+          WHEN 'minor' THEN 1
+          ELSE 0
+        END AS impact_rank
+      FROM incidents
+      WHERE status != 'resolved'
+        AND (
+          NOT EXISTS (
+            SELECT 1
+            FROM incident_monitors scoped_links
+            WHERE scoped_links.incident_id = incidents.id
+          )
+          OR EXISTS (
+            SELECT 1
+            FROM incident_monitors scoped_links
+            JOIN monitors scoped_monitors ON scoped_monitors.id = scoped_links.monitor_id
+            WHERE scoped_links.incident_id = incidents.id
+              AND scoped_monitors.show_on_status_page = 1
+          )
+        )
+      ORDER BY started_at DESC, id DESC
+      LIMIT 20
+    ),
+    active_incidents_json AS (
+      SELECT json_group_array(
+        json_object(
+          'id', id,
+          'title', title,
+          'status', status,
+          'impact', impact,
+          'message', message,
+          'started_at', started_at,
+          'resolved_at', resolved_at
+        )
+      ) AS incidents
+      FROM visible_active_incidents
+    ),
+    active_maintenance_windows AS (
+      SELECT
+        mw.id,
+        mw.title,
+        mw.message,
+        mw.starts_at,
+        mw.ends_at,
+        (
+          SELECT json_group_array(mwm.monitor_id)
+          FROM maintenance_window_monitors mwm
+          JOIN monitors m2 ON m2.id = mwm.monitor_id
+          WHERE mwm.maintenance_window_id = mw.id
+            AND m2.show_on_status_page = 1
+          ORDER BY mwm.monitor_id
+        ) AS monitor_ids
+      FROM maintenance_windows mw
+      WHERE mw.starts_at <= ?1 AND mw.ends_at > ?1
+        AND (
+          NOT EXISTS (
+            SELECT 1
+            FROM maintenance_window_monitors scoped_links
+            WHERE scoped_links.maintenance_window_id = mw.id
+          )
+          OR EXISTS (
+            SELECT 1
+            FROM maintenance_window_monitors scoped_links
+            JOIN monitors scoped_monitors ON scoped_monitors.id = scoped_links.monitor_id
+            WHERE scoped_links.maintenance_window_id = mw.id
+              AND scoped_monitors.show_on_status_page = 1
+          )
+        )
+      ORDER BY mw.starts_at ASC, mw.id ASC
+      LIMIT 20
+    ),
+    active_maintenance_json AS (
+      SELECT json_group_array(
+        json_object(
+          'id', id,
+          'title', title,
+          'message', message,
+          'starts_at', starts_at,
+          'ends_at', ends_at,
+          'monitor_ids', json(COALESCE(monitor_ids, '[]'))
+        )
+      ) AS windows
+      FROM active_maintenance_windows
+    ),
+    upcoming_maintenance_windows AS (
+      SELECT
+        mw.id,
+        mw.title,
+        mw.message,
+        mw.starts_at,
+        mw.ends_at,
+        (
+          SELECT json_group_array(mwm.monitor_id)
+          FROM maintenance_window_monitors mwm
+          JOIN monitors m2 ON m2.id = mwm.monitor_id
+          WHERE mwm.maintenance_window_id = mw.id
+            AND m2.show_on_status_page = 1
+          ORDER BY mwm.monitor_id
+        ) AS monitor_ids
+      FROM maintenance_windows mw
+      WHERE mw.starts_at > ?1
+        AND (
+          NOT EXISTS (
+            SELECT 1
+            FROM maintenance_window_monitors scoped_links
+            WHERE scoped_links.maintenance_window_id = mw.id
+          )
+          OR EXISTS (
+            SELECT 1
+            FROM maintenance_window_monitors scoped_links
+            JOIN monitors scoped_monitors ON scoped_monitors.id = scoped_links.monitor_id
+            WHERE scoped_links.maintenance_window_id = mw.id
+              AND scoped_monitors.show_on_status_page = 1
+          )
+        )
+      ORDER BY mw.starts_at ASC, mw.id ASC
+      LIMIT 20
+    ),
+    upcoming_maintenance_json AS (
+      SELECT json_group_array(
+        json_object(
+          'id', id,
+          'title', title,
+          'message', message,
+          'starts_at', starts_at,
+          'ends_at', ends_at,
+          'monitor_ids', json(COALESCE(monitor_ids, '[]'))
+        )
+      ) AS windows
+      FROM upcoming_maintenance_windows
+    ),
+    resolved_incident_preview_json AS (
+      SELECT json_object(
+        'id', id,
+        'title', title,
+        'status', status,
+        'impact', impact,
+        'message', message,
+        'started_at', started_at,
+        'resolved_at', resolved_at
+      ) AS incident
+      FROM incidents
+      WHERE status = 'resolved'
+        AND (
+          NOT EXISTS (
+            SELECT 1
+            FROM incident_monitors scoped_links
+            WHERE scoped_links.incident_id = incidents.id
+          )
+          OR EXISTS (
+            SELECT 1
+            FROM incident_monitors scoped_links
+            JOIN monitors scoped_monitors ON scoped_monitors.id = scoped_links.monitor_id
+            WHERE scoped_links.incident_id = incidents.id
+              AND scoped_monitors.show_on_status_page = 1
+          )
+        )
+      ORDER BY id DESC
+      LIMIT 1
+    ),
+    maintenance_history_preview_json AS (
+      SELECT json_object(
+        'id', mw.id,
+        'title', mw.title,
+        'message', mw.message,
+        'starts_at', mw.starts_at,
+        'ends_at', mw.ends_at,
+        'monitor_ids', json(COALESCE(mw.monitor_ids, '[]'))
+      ) AS window
+      FROM (
+        SELECT
+          mw.id,
+          mw.title,
+          mw.message,
+          mw.starts_at,
+          mw.ends_at,
+          (
+            SELECT json_group_array(mwm.monitor_id)
+            FROM maintenance_window_monitors mwm
+            JOIN monitors m2 ON m2.id = mwm.monitor_id
+            WHERE mwm.maintenance_window_id = mw.id
+              AND m2.show_on_status_page = 1
+            ORDER BY mwm.monitor_id
+          ) AS monitor_ids
+        FROM maintenance_windows mw
+        WHERE mw.ends_at <= ?1
+          AND (
+            NOT EXISTS (
+              SELECT 1
+              FROM maintenance_window_monitors scoped_links
+              WHERE scoped_links.maintenance_window_id = mw.id
+            )
+            OR EXISTS (
+              SELECT 1
+              FROM maintenance_window_monitors scoped_links
+              JOIN monitors scoped_monitors ON scoped_monitors.id = scoped_links.monitor_id
+              WHERE scoped_links.maintenance_window_id = mw.id
+                AND scoped_monitors.show_on_status_page = 1
+            )
+          )
+        ORDER BY mw.id DESC
+        LIMIT 1
+      ) mw
+    ),
+    banner_json AS (
+      SELECT
+        CASE
+          WHEN (SELECT COUNT(*) FROM visible_active_incidents) > 0
+          THEN (
+            WITH max_rank AS (
+              SELECT COALESCE(MAX(impact_rank), 0) AS r
+              FROM visible_active_incidents
+            ),
+            top_inc AS (
+              SELECT id, title, status, impact
+              FROM visible_active_incidents
+              ORDER BY started_at DESC, id DESC
+              LIMIT 1
+            )
+            SELECT json_object(
+              'source', 'incident',
+              'status',
+                CASE
+                  WHEN (SELECT r FROM max_rank) >= 2 THEN 'major_outage'
+                  WHEN (SELECT r FROM max_rank) = 1 THEN 'partial_outage'
+                  ELSE 'operational'
+                END,
+              'title',
+                CASE
+                  WHEN (SELECT r FROM max_rank) >= 2 THEN 'Major Outage'
+                  WHEN (SELECT r FROM max_rank) = 1 THEN 'Partial Outage'
+                  ELSE 'Incident'
+                END,
+              'incident', (
+                SELECT json_object(
+                  'id', id,
+                  'title', title,
+                  'status', status,
+                  'impact', impact
+                )
+                FROM top_inc
+              )
+            )
+          )
+          WHEN (SELECT down FROM summary) > 0
+          THEN json_object(
+            'source', 'monitors',
+            'status',
+              CASE
+                WHEN (SELECT monitor_count_total FROM summary) = 0 THEN 'partial_outage'
+                WHEN (CAST((SELECT down FROM summary) AS REAL) / (SELECT monitor_count_total FROM summary)) >= 0.3
+                THEN 'major_outage'
+                ELSE 'partial_outage'
+              END,
+            'title',
+              CASE
+                WHEN (SELECT monitor_count_total FROM summary) > 0
+                  AND (CAST((SELECT down FROM summary) AS REAL) / (SELECT monitor_count_total FROM summary)) >= 0.3
+                THEN 'Major Outage'
+                ELSE 'Partial Outage'
+              END,
+            'down_ratio',
+              CASE
+                WHEN (SELECT monitor_count_total FROM summary) = 0 THEN 0
+                ELSE (CAST((SELECT down FROM summary) AS REAL) / (SELECT monitor_count_total FROM summary))
+              END
+          )
+          WHEN (SELECT unknown FROM summary) > 0
+          THEN json_object(
+            'source', 'monitors',
+            'status', 'unknown',
+            'title', 'Status Unknown'
+          )
+          WHEN (SELECT COUNT(*) FROM active_maintenance_windows) > 0
+          THEN (
+            WITH top_mw AS (
+              SELECT id, title, starts_at, ends_at
+              FROM active_maintenance_windows
+              ORDER BY starts_at ASC, id ASC
+              LIMIT 1
+            )
+            SELECT json_object(
+              'source', 'maintenance',
+              'status', 'maintenance',
+              'title', 'Maintenance',
+              'maintenance_window', (
+                SELECT json_object(
+                  'id', id,
+                  'title', title,
+                  'starts_at', starts_at,
+                  'ends_at', ends_at
+                )
+                FROM top_mw
+              )
+            )
+          )
+          WHEN (SELECT maintenance FROM summary) > 0
+          THEN json_object(
+            'source', 'monitors',
+            'status', 'maintenance',
+            'title', 'Maintenance'
+          )
+          ELSE json_object(
+            'source', 'monitors',
+            'status', 'operational',
+            'title', 'All Systems Operational'
+          )
+        END AS banner
+    ),
+    homepage_json AS (
+      SELECT json_object(
+        'generated_at', ?1,
+        'bootstrap_mode', 'full',
+        'monitor_count_total', (SELECT monitor_count_total FROM summary),
+        'site_title', ?2,
+        'site_description', ?3,
+        'site_locale', ?4,
+        'site_timezone', ?5,
+        'uptime_rating_level', ?6,
+        'overall_status', (SELECT overall_status FROM overall),
+        'banner', json((SELECT banner FROM banner_json)),
+        'summary', json_object(
+          'up', (SELECT up FROM summary),
+          'down', (SELECT down FROM summary),
+          'maintenance', (SELECT maintenance FROM summary),
+          'paused', (SELECT paused FROM summary),
+          'unknown', (SELECT unknown FROM summary)
+        ),
+        'monitors', json(COALESCE((SELECT monitors FROM monitors_json), '[]')),
+        'active_incidents', json(COALESCE((SELECT incidents FROM active_incidents_json), '[]')),
+        'maintenance_windows', json_object(
+          'active', json(COALESCE((SELECT windows FROM active_maintenance_json), '[]')),
+          'upcoming', json(COALESCE((SELECT windows FROM upcoming_maintenance_json), '[]'))
+        ),
+        'resolved_incident_preview', json((SELECT incident FROM resolved_incident_preview_json)),
+        'maintenance_history_preview', json((SELECT window FROM maintenance_history_preview_json))
+      ) AS body_json
+    )
+  INSERT INTO public_snapshots (key, generated_at, body_json, updated_at)
+  SELECT '${SNAPSHOT_KEY}', ?1, body_json, ?1
+  FROM homepage_json
+  WHERE 1 = 1
+  ON CONFLICT(key) DO UPDATE SET
+    generated_at = excluded.generated_at,
+    body_json = excluded.body_json,
+    updated_at = excluded.updated_at
+`;
+
+export const __testOnly_homepageDataSnapshotSql = HOMEPAGE_DATA_SNAPSHOT_SQL;
+
+export async function refreshPublicHomepageSnapshotSqlIfNeeded(opts: {
+  db: D1Database;
+  now: number;
+  settings: HomepageSnapshotSiteSettings;
+}): Promise<boolean> {
+  const generatedAt = await readHomepageSnapshotGeneratedAt(opts.db);
+  if (generatedAt !== null && isSameMinute(generatedAt, opts.now)) {
+    return false;
+  }
+
+  const acquired = await acquireLease(opts.db, REFRESH_DATA_SQL_LOCK_NAME, opts.now, 55);
+  if (!acquired) {
+    return false;
+  }
+
+  const latestGeneratedAt = await readHomepageSnapshotGeneratedAt(opts.db);
+  if (latestGeneratedAt !== null && isSameMinute(latestGeneratedAt, opts.now)) {
+    return false;
+  }
+
+  await opts.db
+    .prepare(HOMEPAGE_DATA_SNAPSHOT_SQL)
+    .bind(
+      opts.now,
+      opts.settings.site_title,
+      opts.settings.site_description,
+      opts.settings.site_locale,
+      opts.settings.site_timezone,
+      opts.settings.uptime_rating_level,
+    )
+    .run();
+
   return true;
 }
