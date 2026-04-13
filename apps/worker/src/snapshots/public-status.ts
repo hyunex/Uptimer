@@ -12,6 +12,31 @@ export function getSnapshotMaxAgeSeconds() {
   return MAX_AGE_SECONDS;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+function looksLikeStatusPayload(value: unknown): value is PublicStatusResponse {
+  if (!isRecord(value)) return false;
+  const maintenance = value.maintenance_windows;
+  return (
+    typeof value.generated_at === 'number' &&
+    typeof value.site_title === 'string' &&
+    typeof value.site_description === 'string' &&
+    typeof value.site_locale === 'string' &&
+    typeof value.site_timezone === 'string' &&
+    typeof value.uptime_rating_level === 'number' &&
+    typeof value.overall_status === 'string' &&
+    isRecord(value.banner) &&
+    isRecord(value.summary) &&
+    Array.isArray(value.monitors) &&
+    Array.isArray(value.active_incidents) &&
+    isRecord(maintenance) &&
+    Array.isArray(maintenance.active) &&
+    Array.isArray(maintenance.upcoming)
+  );
+}
+
 function safeJsonParse(text: string): unknown | null {
   const trimmed = text.trim();
   if (!trimmed) return null;
@@ -44,12 +69,15 @@ export async function readStatusSnapshot(
     if (age > MAX_AGE_SECONDS) return null;
 
     const parsed = safeJsonParse(row.body_json);
-    const validated = publicStatusResponseSchema.safeParse(parsed);
-    if (!validated.success) {
+    if (parsed === null) {
+      console.warn('public snapshot: invalid JSON, falling back to live');
+      return null;
+    }
+    if (!looksLikeStatusPayload(parsed)) {
       console.warn('public snapshot: invalid payload, falling back to live');
       return null;
     }
-    return { data: validated.data, age };
+    return { data: parsed, age };
   } catch (err) {
     // Backward compatible: if the table doesn't exist yet or snapshot is invalid,
     // callers should fall back to live computation.
@@ -80,8 +108,11 @@ export async function readStatusSnapshotJson(
     if (age > MAX_AGE_SECONDS) return null;
 
     const parsed = safeJsonParse(row.body_json);
-    const validated = publicStatusResponseSchema.safeParse(parsed);
-    if (!validated.success) {
+    if (parsed === null) {
+      console.warn('public snapshot: invalid JSON, falling back to live');
+      return null;
+    }
+    if (!looksLikeStatusPayload(parsed)) {
       console.warn('public snapshot: invalid payload, falling back to live');
       return null;
     }

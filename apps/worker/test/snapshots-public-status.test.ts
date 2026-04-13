@@ -91,6 +91,38 @@ describe('snapshots/public-status', () => {
     warn.mockRestore();
   });
 
+  it('falls back to live compute when snapshot payload shape is invalid', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    const now = 200;
+    const payload = { generated_at: 190, monitors: [] };
+    const db = createFakeD1Database([
+      {
+        match: 'from public_snapshots',
+        first: () => ({
+          generated_at: 190,
+          body_json: JSON.stringify(payload),
+        }),
+      },
+    ]);
+
+    await expect(readStatusSnapshot(db, now)).resolves.toBeNull();
+    await expect(readStatusSnapshotJson(db, now)).resolves.toBeNull();
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it('falls back to live compute when snapshot reads fail', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    const db = createFakeD1Database([]);
+    await expect(readStatusSnapshot(db, 200)).resolves.toBeNull();
+    await expect(readStatusSnapshotJson(db, 200)).resolves.toBeNull();
+
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
   it('serves the raw snapshot JSON when it looks complete', async () => {
     const now = 200;
     const payload = samplePayload(190);
