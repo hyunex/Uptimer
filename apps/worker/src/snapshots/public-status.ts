@@ -3,6 +3,13 @@ import { publicStatusResponseSchema, type PublicStatusResponse } from '../schema
 
 const SNAPSHOT_KEY = 'status';
 const MAX_AGE_SECONDS = 60;
+const READ_STATUS_SQL = `
+  SELECT generated_at, body_json
+  FROM public_snapshots
+  WHERE key = ?1
+`;
+
+const readStatusStatementByDb = new WeakMap<D1Database, D1PreparedStatement>();
 
 export function getSnapshotKey() {
   return SNAPSHOT_KEY;
@@ -52,14 +59,13 @@ export async function readStatusSnapshot(
   now: number,
 ): Promise<{ data: PublicStatusResponse; age: number } | null> {
   try {
-    const row = await db
-      .prepare(
-        `
-        SELECT generated_at, body_json
-        FROM public_snapshots
-        WHERE key = ?1
-      `,
-      )
+    const cached = readStatusStatementByDb.get(db);
+    const statement = cached ?? db.prepare(READ_STATUS_SQL);
+    if (!cached) {
+      readStatusStatementByDb.set(db, statement);
+    }
+
+    const row = await statement
       .bind(SNAPSHOT_KEY)
       .first<{ generated_at: number; body_json: string }>();
 
@@ -91,14 +97,13 @@ export async function readStatusSnapshotJson(
   now: number,
 ): Promise<{ bodyJson: string; age: number } | null> {
   try {
-    const row = await db
-      .prepare(
-        `
-        SELECT generated_at, body_json
-        FROM public_snapshots
-        WHERE key = ?1
-      `,
-      )
+    const cached = readStatusStatementByDb.get(db);
+    const statement = cached ?? db.prepare(READ_STATUS_SQL);
+    if (!cached) {
+      readStatusStatementByDb.set(db, statement);
+    }
+
+    const row = await statement
       .bind(SNAPSHOT_KEY)
       .first<{ generated_at: number; body_json: string }>();
 

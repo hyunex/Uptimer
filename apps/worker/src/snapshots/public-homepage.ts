@@ -11,6 +11,11 @@ const MAX_AGE_SECONDS = 60;
 const MAX_STALE_SECONDS = 10 * 60;
 const REFRESH_LOCK_NAME = 'snapshot:homepage:refresh';
 const MAX_BOOTSTRAP_MONITORS = 12;
+const READ_SNAPSHOT_SQL = `
+  SELECT generated_at, body_json
+  FROM public_snapshots
+  WHERE key = ?1
+`;
 
 const SPLIT_SNAPSHOT_VERSION = 3;
 const LEGACY_COMBINED_SNAPSHOT_VERSION = 2;
@@ -22,6 +27,8 @@ export type PublicHomepageRenderArtifact = {
   meta_title: string;
   meta_description: string;
 };
+
+const readSnapshotStatementByDb = new WeakMap<D1Database, D1PreparedStatement>();
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
@@ -427,14 +434,13 @@ async function readSnapshotRow(
   key: string,
 ): Promise<{ generated_at: number; body_json: string } | null> {
   try {
-    return await db
-      .prepare(
-        `
-        SELECT generated_at, body_json
-        FROM public_snapshots
-        WHERE key = ?1
-      `,
-      )
+    const cached = readSnapshotStatementByDb.get(db);
+    const statement = cached ?? db.prepare(READ_SNAPSHOT_SQL);
+    if (!cached) {
+      readSnapshotStatementByDb.set(db, statement);
+    }
+
+    return await statement
       .bind(key)
       .first<{ generated_at: number; body_json: string }>();
   } catch (err) {
