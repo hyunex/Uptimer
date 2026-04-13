@@ -402,6 +402,305 @@ export async function computeTodayPartialUptimeBatch(
   rangeStart: number,
   now: number,
 ): Promise<Map<number, UptimeWindowTotals>> {
+  try {
+    return await computeTodayPartialUptimeBatchSql(db, monitors, rangeStart, now);
+  } catch (err) {
+    console.warn('uptime: today batch SQL failed, falling back to legacy', err);
+    return await computeTodayPartialUptimeBatchLegacy(db, monitors, rangeStart, now);
+  }
+}
+
+async function computeTodayPartialUptimeBatchSql(
+  db: D1Database,
+  monitors: Array<{
+    id: number;
+    interval_sec: number;
+    created_at: number;
+    last_checked_at: number | null;
+  }>,
+  rangeStart: number,
+  now: number,
+): Promise<Map<number, UptimeWindowTotals>> {
+  const out = new Map<number, UptimeWindowTotals>();
+
+  const monitorById = new Map<number, (typeof monitors)[number]>();
+  for (const monitor of monitors) {
+    if (!Number.isInteger(monitor.id) || monitor.id <= 0) continue;
+    if (monitorById.has(monitor.id)) continue;
+    monitorById.set(monitor.id, monitor);
+  }
+
+  const normalizedMonitors = [...monitorById.values()];
+  if (normalizedMonitors.length === 0) return out;
+
+  const ids = normalizedMonitors.map((monitor) => monitor.id);
+
+  if (now <= rangeStart) {
+    for (const id of ids) {
+      out.set(id, {
+        total_sec: 0,
+        downtime_sec: 0,
+        unknown_sec: 0,
+        uptime_sec: 0,
+        uptime_pct: null,
+      });
+    }
+    return out;
+  }
+
+  for (const id of ids) {
+    out.set(id, {
+      total_sec: 0,
+      downtime_sec: 0,
+      unknown_sec: 0,
+      uptime_sec: 0,
+      uptime_pct: null,
+    });
+  }
+
+  const CHUNK_SIZE = 200;
+  for (let start = 0; start < normalizedMonitors.length; start += CHUNK_SIZE) {
+    const chunk = normalizedMonitors.slice(start, start + CHUNK_SIZE);
+    const valuesPlaceholders = chunk
+      .map((_, index) => {
+        const base = 3 + index * 4;
+        return `(?${base}, ?${base + 1}, ?${base + 2}, ?${base + 3})`;
+      })
+      .join(', ');
+
+    const stmt = db.prepare(
+      `
+      WITH input(monitor_id, interval_sec, created_at, last_checked_at) AS (
+        VALUES ${valuesPlaceholders}
+      ),
+      first_checks AS (
+        SELECT monitor_id, MIN(checked_at) AS first_check_at
+        FROM check_results
+        WHERE monitor_id IN (SELECT monitor_id FROM input)
+          AND checked_at >= ?1
+          AND checked_at < ?2
+        GROUP BY monitor_id
+      ),
+      effective AS (
+        SELECT
+          i.monitor_id AS monitor_id,
+          i.interval_sec AS interval_sec,
+          CASE
+            WHEN i.created_at > ?1 THEN
+              COALESCE(
+                fc.first_check_at,
+                CASE WHEN i.last_checked_at IS NULL THEN NULL ELSE i.created_at END
+              )
+            ELSE ?1
+          END AS start_at
+        FROM input i
+        LEFT JOIN first_checks fc ON fc.monitor_id = i.monitor_id
+      ),
+      downtime_segments AS (
+        SELECT
+          o.monitor_id AS monitor_id,
+          max(o.started_at, e.start_at) AS seg_start,
+          min(coalesce(o.ended_at, ?2), ?2) AS seg_end
+        FROM outages o
+        JOIN effective e ON e.monitor_id = o.monitor_id
+        WHERE e.start_at IS NOT NULL
+          AND o.started_at < ?2
+          AND (o.ended_at IS NULL OR o.ended_at > e.start_at)
+      ),
+      downtime AS (
+        SELECT monitor_id, sum(max(0, seg_end - seg_start)) AS downtime_sec
+        FROM downtime_segments
+        GROUP BY monitor_id
+      ),
+      checks AS (
+        SELECT
+          cr.monitor_id AS monitor_id,
+          cr.checked_at AS checked_at,
+          cr.status AS status,
+          e.interval_sec AS interval_sec,
+          e.start_at AS start_at,
+          lag(cr.checked_at) OVER (
+            PARTITION BY cr.monitor_id
+            ORDER BY cr.checked_at
+          ) AS prev_at,
+          lag(cr.status) OVER (
+            PARTITION BY cr.monitor_id
+            ORDER BY cr.checked_at
+          ) AS prev_status
+        FROM check_results cr
+        JOIN effective e ON e.monitor_id = cr.monitor_id
+        WHERE e.start_at IS NOT NULL
+          AND cr.checked_at >= max(0, e.start_at - e.interval_sec * 2)
+          AND cr.checked_at < ?2
+      ),
+      unknown_checks AS (
+        SELECT
+          monitor_id AS monitor_id,
+          CASE
+            WHEN prev_at IS NULL THEN start_at
+            WHEN prev_status = 'unknown' THEN (CASE WHEN prev_at >= start_at THEN prev_at ELSE start_at END)
+            ELSE max(
+              (CASE WHEN prev_at >= start_at THEN prev_at ELSE start_at END),
+              prev_at + interval_sec * 2
+            )
+          END AS seg_start,
+          checked_at AS seg_end
+        FROM checks
+        WHERE checked_at >= start_at
+      ),
+      last_any AS (
+        SELECT monitor_id, checked_at, status
+        FROM (
+          SELECT
+            monitor_id,
+            checked_at,
+            status,
+            row_number() OVER (
+              PARTITION BY monitor_id
+              ORDER BY checked_at DESC
+            ) AS rn
+          FROM checks
+        )
+        WHERE rn = 1
+      ),
+      last_in_range AS (
+        SELECT monitor_id, checked_at
+        FROM (
+          SELECT
+            monitor_id,
+            checked_at,
+            row_number() OVER (
+              PARTITION BY monitor_id
+              ORDER BY checked_at DESC
+            ) AS rn
+          FROM checks
+          WHERE checked_at >= start_at
+        )
+        WHERE rn = 1
+      ),
+      unknown_tail AS (
+        SELECT
+          e.monitor_id AS monitor_id,
+          CASE
+            WHEN la.checked_at IS NULL THEN coalesce(lir.checked_at, e.start_at)
+            WHEN la.status = 'unknown' THEN coalesce(lir.checked_at, e.start_at)
+            ELSE max(coalesce(lir.checked_at, e.start_at), la.checked_at + e.interval_sec * 2)
+          END AS seg_start,
+          ?2 AS seg_end
+        FROM effective e
+        LEFT JOIN last_any la ON la.monitor_id = e.monitor_id
+        LEFT JOIN last_in_range lir ON lir.monitor_id = e.monitor_id
+        WHERE e.start_at IS NOT NULL
+      ),
+      unknown_segments AS (
+        SELECT monitor_id, seg_start, seg_end
+        FROM unknown_checks
+        WHERE seg_end > seg_start
+        UNION ALL
+        SELECT monitor_id, seg_start, seg_end
+        FROM unknown_tail
+        WHERE seg_end > seg_start
+      ),
+      unknown_raw AS (
+        SELECT monitor_id, sum(seg_end - seg_start) AS unknown_raw_sec
+        FROM unknown_segments
+        GROUP BY monitor_id
+      ),
+      unknown_overlap AS (
+        SELECT
+          u.monitor_id AS monitor_id,
+          sum(
+            max(0, min(u.seg_end, d.seg_end) - max(u.seg_start, d.seg_start))
+          ) AS overlap_sec
+        FROM unknown_segments u
+        JOIN downtime_segments d ON d.monitor_id = u.monitor_id
+        WHERE u.seg_end > d.seg_start AND d.seg_end > u.seg_start
+        GROUP BY u.monitor_id
+      )
+      SELECT
+        e.monitor_id AS monitor_id,
+        e.start_at AS start_at,
+        (?2 - e.start_at) AS total_sec,
+        coalesce(d.downtime_sec, 0) AS downtime_sec,
+        max(0, coalesce(u.unknown_raw_sec, 0) - coalesce(o.overlap_sec, 0)) AS unknown_sec
+      FROM effective e
+      LEFT JOIN downtime d ON d.monitor_id = e.monitor_id
+      LEFT JOIN unknown_raw u ON u.monitor_id = e.monitor_id
+      LEFT JOIN unknown_overlap o ON o.monitor_id = e.monitor_id
+      WHERE e.start_at IS NOT NULL
+      `,
+    );
+
+    const args: unknown[] = [rangeStart, now];
+    for (const monitor of chunk) {
+      args.push(monitor.id, monitor.interval_sec, monitor.created_at, monitor.last_checked_at);
+    }
+
+    const { results } = await stmt
+      .bind(...args)
+      .all<{
+        monitor_id: number;
+        start_at: number;
+        total_sec: number;
+        downtime_sec: number;
+        unknown_sec: number;
+      }>();
+
+    const rows = results ?? [];
+    const shouldReturnAtLeastOneRow = chunk.some(
+      (monitor) => monitor.created_at <= rangeStart || monitor.last_checked_at !== null,
+    );
+    if (shouldReturnAtLeastOneRow && rows.length === 0) {
+      throw new Error('uptime: today batch SQL returned no rows');
+    }
+
+    for (const row of rows) {
+      if (
+        !Number.isInteger(row.monitor_id) ||
+        row.monitor_id <= 0 ||
+        !Number.isFinite(row.total_sec) ||
+        !Number.isFinite(row.downtime_sec) ||
+        !Number.isFinite(row.unknown_sec)
+      ) {
+        throw new Error('uptime: today batch SQL returned an invalid row');
+      }
+
+      const monitorId = row.monitor_id;
+      if (!monitorById.has(monitorId)) continue;
+
+      const total_sec = Math.max(0, row.total_sec ?? 0);
+      if (total_sec === 0) continue;
+
+      const downtime_sec = Math.max(0, row.downtime_sec ?? 0);
+      const unknown_sec = Math.max(0, row.unknown_sec ?? 0);
+      const unavailable_sec = Math.min(total_sec, downtime_sec + unknown_sec);
+      const uptime_sec = Math.max(0, total_sec - unavailable_sec);
+      const uptime_pct = total_sec === 0 ? null : (uptime_sec / total_sec) * 100;
+
+      out.set(monitorId, {
+        total_sec,
+        downtime_sec,
+        unknown_sec,
+        uptime_sec,
+        uptime_pct,
+      });
+    }
+  }
+
+  return out;
+}
+
+async function computeTodayPartialUptimeBatchLegacy(
+  db: D1Database,
+  monitors: Array<{
+    id: number;
+    interval_sec: number;
+    created_at: number;
+    last_checked_at: number | null;
+  }>,
+  rangeStart: number,
+  now: number,
+): Promise<Map<number, UptimeWindowTotals>> {
   const out = new Map<number, UptimeWindowTotals>();
 
   const monitorById = new Map<
