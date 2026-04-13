@@ -46,13 +46,15 @@ class FakePreparedStatement {
   constructor(
     private readonly sql: string,
     private readonly handlers: FakeD1QueryHandler[],
+    normalizedSql?: string,
   ) {
-    this.normalizedSql = normalizeSql(sql);
+    this.normalizedSql = normalizedSql ?? normalizeSql(sql);
   }
 
-  bind(...args: unknown[]): this {
-    this.args = args;
-    return this;
+  bind(...args: unknown[]): FakePreparedStatement {
+    const bound = new FakePreparedStatement(this.sql, this.handlers, this.normalizedSql);
+    bound.args = args;
+    return bound;
   }
 
   async all<T = unknown>(): Promise<{ results: T[] }> {
