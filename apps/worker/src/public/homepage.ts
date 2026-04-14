@@ -12,7 +12,6 @@ import {
   toIncidentImpact,
   toIncidentStatus,
   toMonitorStatus,
-  toUptimePct,
   utcDayStart,
   type IncidentRow,
   type MaintenanceWindowRow,
@@ -49,26 +48,37 @@ type HomepageMonitorRow = {
   last_checked_at: number | null;
 };
 
-type HomepageHeartbeatRawRow = [
+type HomepageHeartbeatStripAggRawRow = [
   monitor_id: number,
-  checked_at: number,
-  status: string,
-  latency_ms: number | null,
+  checked_at_json: string | null,
+  latency_ms_json: string | null,
+  status_codes: string | null,
 ];
 
-type HomepageRollupRawRow = [
+type HomepageUptimeDayStripAggRawRow = [
   monitor_id: number,
-  day_start_at: number,
-  total_sec: number | null,
-  downtime_sec: number | null,
-  unknown_sec: number | null,
-  uptime_sec: number | null,
+  day_start_at_json: string | null,
+  downtime_sec_json: string | null,
+  unknown_sec_json: string | null,
+  uptime_pct_milli_json: string | null,
+  total_sec_sum: number | null,
+  uptime_sec_sum: number | null,
 ];
 
 type HomepageMonitorDataOptions = {
   cardLimit?: number;
   uptimeRatingLevel?: 1 | 2 | 3 | 4 | 5;
 };
+
+function safeParseJsonArray<T>(text: string | null): T[] {
+  if (!text) return [];
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    return Array.isArray(parsed) ? (parsed as T[]) : [];
+  } catch {
+    return [];
+  }
+}
 
 function toHeartbeatStatusCode(status: string | null | undefined): string {
   switch (status) {
@@ -453,42 +463,77 @@ async function buildHomepageMonitorCardsFromRows(
   const heartbeatRowsPromise = db
     .prepare(
       `
-      SELECT monitor_id, checked_at, status, latency_ms
+      SELECT
+        monitor_id,
+        json_group_array(checked_at) AS checked_at_json,
+        json_group_array(latency_ms) AS latency_ms_json,
+        group_concat(status_code, '') AS status_codes
       FROM (
         SELECT
-          id,
           monitor_id,
           checked_at,
-          status,
           latency_ms,
-          ROW_NUMBER() OVER (
-            PARTITION BY monitor_id
-            ORDER BY checked_at DESC, id DESC
-          ) AS rn
-        FROM check_results
-        WHERE monitor_id IN (${placeholders})
+          CASE status
+            WHEN 'up' THEN 'u'
+            WHEN 'down' THEN 'd'
+            WHEN 'maintenance' THEN 'm'
+            ELSE 'x'
+          END AS status_code
+        FROM (
+          SELECT
+            id,
+            monitor_id,
+            checked_at,
+            status,
+            latency_ms,
+            ROW_NUMBER() OVER (
+              PARTITION BY monitor_id
+              ORDER BY checked_at DESC, id DESC
+            ) AS rn
+          FROM check_results
+          WHERE monitor_id IN (${placeholders})
+        )
+        WHERE rn <= ?${selectedIds.length + 1}
+        ORDER BY monitor_id, checked_at DESC, id DESC
       )
-      WHERE rn <= ?${selectedIds.length + 1}
-      ORDER BY monitor_id, checked_at DESC, id DESC
+      GROUP BY monitor_id
+      ORDER BY monitor_id
     `,
     )
     .bind(...selectedIds, HEARTBEAT_POINTS)
-    .raw<HomepageHeartbeatRawRow>()
+    .raw<HomepageHeartbeatStripAggRawRow>()
     .then((rows) => rows ?? []);
 
   const rollupRowsPromise = db
     .prepare(
       `
-      SELECT monitor_id, day_start_at, total_sec, downtime_sec, unknown_sec, uptime_sec
-      FROM monitor_daily_rollups
-      WHERE monitor_id IN (${placeholders})
-        AND day_start_at >= ?${selectedIds.length + 1}
-        AND day_start_at < ?${selectedIds.length + 2}
-      ORDER BY monitor_id, day_start_at
+      SELECT
+        monitor_id,
+        json_group_array(day_start_at) AS day_start_at_json,
+        json_group_array(downtime_sec) AS downtime_sec_json,
+        json_group_array(unknown_sec) AS unknown_sec_json,
+        json_group_array(
+          CASE
+            WHEN total_sec IS NULL OR total_sec = 0 THEN NULL
+            ELSE CAST(round((uptime_sec * 100000.0) / total_sec) AS INTEGER)
+          END
+        ) AS uptime_pct_milli_json,
+        sum(total_sec) AS total_sec_sum,
+        sum(uptime_sec) AS uptime_sec_sum
+      FROM (
+        SELECT monitor_id, day_start_at, total_sec, downtime_sec, unknown_sec, uptime_sec
+        FROM monitor_daily_rollups
+        WHERE monitor_id IN (${placeholders})
+          AND day_start_at >= ?${selectedIds.length + 1}
+          AND day_start_at < ?${selectedIds.length + 2}
+        ORDER BY monitor_id, day_start_at
+      )
+      GROUP BY monitor_id
+      ORDER BY monitor_id
     `,
     )
     .bind(...selectedIds, rangeStart, rangeEndFullDays)
-    .raw<HomepageRollupRawRow>()
+    .raw<HomepageUptimeDayStripAggRawRow>()
     .then((rows) => rows ?? []);
 
   const todayByMonitorIdPromise: Promise<Map<number, UptimeWindowTotals>> = needsToday
@@ -511,18 +556,16 @@ async function buildHomepageMonitorCardsFromRows(
     todayByMonitorIdPromise,
   ]);
 
-  const heartbeatStatusCodes = Array.from({ length: monitors.length }, () => [] as string[]);
   for (const row of heartbeatRows) {
     const index = monitorIndexById.get(row[0]);
     if (index === undefined) continue;
 
     const monitor = monitors[index];
-    const statusCodes = heartbeatStatusCodes[index];
-    if (!monitor || !statusCodes) continue;
+    if (!monitor) continue;
 
-    monitor.heartbeat_strip.checked_at.push(row[1]);
-    monitor.heartbeat_strip.latency_ms.push(row[3]);
-    statusCodes.push(toHeartbeatStatusCode(row[2]));
+    monitor.heartbeat_strip.checked_at = safeParseJsonArray<number>(row[1]);
+    monitor.heartbeat_strip.latency_ms = safeParseJsonArray<number | null>(row[2]);
+    monitor.heartbeat_strip.status_codes = row[3] ?? '';
   }
 
   const totalsByMonitor = Array.from({ length: monitors.length }, () => ({
@@ -537,13 +580,12 @@ async function buildHomepageMonitorCardsFromRows(
     const totals = totalsByMonitor[index];
     if (!monitor || !totals) continue;
 
-    addUptimeDay(monitor, totals, row[1], {
-      total_sec: row[2] ?? 0,
-      downtime_sec: row[3] ?? 0,
-      unknown_sec: row[4] ?? 0,
-      uptime_sec: row[5] ?? 0,
-      uptime_pct: toUptimePct(row[2] ?? 0, row[5] ?? 0),
-    });
+    monitor.uptime_day_strip.day_start_at = safeParseJsonArray<number>(row[1]);
+    monitor.uptime_day_strip.downtime_sec = safeParseJsonArray<number>(row[2]);
+    monitor.uptime_day_strip.unknown_sec = safeParseJsonArray<number>(row[3]);
+    monitor.uptime_day_strip.uptime_pct_milli = safeParseJsonArray<number | null>(row[4]);
+    totals.totalSec = row[5] ?? 0;
+    totals.uptimeSec = row[6] ?? 0;
   }
 
   if (needsToday) {
@@ -559,11 +601,9 @@ async function buildHomepageMonitorCardsFromRows(
 
   for (let index = 0; index < monitors.length; index += 1) {
     const monitor = monitors[index];
-    const statusCodes = heartbeatStatusCodes[index];
     const totals = totalsByMonitor[index];
-    if (!monitor || !statusCodes || !totals) continue;
+    if (!monitor || !totals) continue;
 
-    monitor.heartbeat_strip.status_codes = statusCodes.join('');
     monitor.uptime_30d =
       totals.totalSec === 0
         ? null

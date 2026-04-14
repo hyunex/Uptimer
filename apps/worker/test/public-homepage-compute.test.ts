@@ -30,41 +30,28 @@ describe('computePublicHomepagePayload', () => {
         all: () => [],
       },
       {
-        match: 'row_number() over',
-        all: () => [
-          {
-            monitor_id: 1,
-            checked_at: now - 60,
-            status: 'up',
-            latency_ms: 42,
-          },
-          {
-            monitor_id: 1,
-            checked_at: now - 120,
-            status: 'down',
-            latency_ms: null,
-          },
+        match: 'json_group_array(checked_at)',
+        raw: () => [
+          [
+            1,
+            JSON.stringify([now - 60, now - 120]),
+            JSON.stringify([42, null]),
+            'ud',
+          ],
         ],
       },
       {
-        match: 'from monitor_daily_rollups',
-        all: () => [
-          {
-            monitor_id: 1,
-            day_start_at: now - 2 * 86_400,
-            total_sec: 86_400,
-            downtime_sec: 0,
-            unknown_sec: 0,
-            uptime_sec: 86_400,
-          },
-          {
-            monitor_id: 1,
-            day_start_at: now - 86_400,
-            total_sec: 86_400,
-            downtime_sec: 60,
-            unknown_sec: 0,
-            uptime_sec: 86_340,
-          },
+        match: 'json_group_array(day_start_at)',
+        raw: () => [
+          [
+            1,
+            JSON.stringify([now - 2 * 86_400, now - 86_400]),
+            JSON.stringify([0, 60]),
+            JSON.stringify([0, 0]),
+            JSON.stringify([100_000, 99_931]),
+            172_800,
+            172_740,
+          ],
         ],
       },
       {
@@ -174,19 +161,12 @@ describe('computePublicHomepagePayload', () => {
         all: () => [],
       },
       {
-        match: 'row_number() over',
-        all: () => [
-          {
-            monitor_id: 1,
-            checked_at: now - 120,
-            status: 'up',
-            latency_ms: 42,
-          },
-        ],
+        match: 'json_group_array(checked_at)',
+        raw: () => [[1, JSON.stringify([now - 120]), JSON.stringify([42]), 'u']],
       },
       {
-        match: 'from monitor_daily_rollups',
-        all: () => [],
+        match: 'json_group_array(day_start_at)',
+        raw: () => [],
       },
       {
         match: 'select monitor_id, started_at, ended_at',
