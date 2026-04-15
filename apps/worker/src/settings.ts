@@ -102,10 +102,15 @@ export function parseSettingsPatch(rawBody: unknown): SettingsPatchInput {
   return r.data;
 }
 
-export async function readSettings(db: D1Database): Promise<SettingsResponse['settings']> {
-  const cachedResult = settingsCacheByDb.get(db);
-  if (cachedResult && Date.now() - cachedResult.fetchedAtMs < SETTINGS_CACHE_TTL_MS) {
-    return cachedResult.settings;
+export async function readSettings(
+  db: D1Database,
+  opts: { bypassCache?: boolean } = {},
+): Promise<SettingsResponse['settings']> {
+  if (!opts.bypassCache) {
+    const cachedResult = settingsCacheByDb.get(db);
+    if (cachedResult && Date.now() - cachedResult.fetchedAtMs < SETTINGS_CACHE_TTL_MS) {
+      return cachedResult.settings;
+    }
   }
 
   const cached = readSettingsStatementByDb.get(db);
@@ -182,7 +187,9 @@ export async function readSettings(db: D1Database): Promise<SettingsResponse['se
     uptime_rating_level,
   };
 
-  settingsCacheByDb.set(db, { fetchedAtMs: Date.now(), settings });
+  if (!opts.bypassCache) {
+    settingsCacheByDb.set(db, { fetchedAtMs: Date.now(), settings });
+  }
   return settings;
 }
 

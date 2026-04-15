@@ -103,6 +103,9 @@ type ScheduledCheckBatchServiceContext = {
 
 async function refreshHomepageSnapshotViaService(
   env: Env,
+  opts: {
+    runtimeUpdates?: MonitorRuntimeUpdate[];
+  } = {},
 ): Promise<HomepageRefreshServiceResult> {
   if (!env.SELF) {
     throw new Error('SELF service binding missing');
@@ -111,14 +114,22 @@ async function refreshHomepageSnapshotViaService(
     throw new Error('ADMIN_TOKEN missing');
   }
 
+  const runtimeUpdates = opts.runtimeUpdates?.length ? opts.runtimeUpdates : undefined;
   const res = await env.SELF.fetch(
     new Request('http://internal/api/v1/internal/refresh/homepage', {
       method: 'POST',
       headers: {
-        'Content-Type': 'text/plain; charset=utf-8',
+        'Content-Type': runtimeUpdates
+          ? 'application/json; charset=utf-8'
+          : 'text/plain; charset=utf-8',
         'X-Uptimer-Refresh-Source': 'scheduled',
       },
-      body: env.ADMIN_TOKEN,
+      body: runtimeUpdates
+        ? JSON.stringify({
+            token: env.ADMIN_TOKEN,
+            runtime_updates: runtimeUpdates,
+          })
+        : env.ADMIN_TOKEN,
     }),
   );
 
@@ -951,9 +962,12 @@ export async function runScheduledTick(env: Env, ctx: ExecutionContext): Promise
   const now = Math.floor(Date.now() / 1000);
   const checkedAt = Math.floor(now / 60) * 60;
   const totalStart = performance.now();
-  const queueHomepageRefresh = () =>
+  const queueHomepageRefresh = (runtimeUpdates?: MonitorRuntimeUpdate[]) =>
     env.SELF
-      ? refreshHomepageSnapshotViaService(env).catch(async (err) => {
+      ? refreshHomepageSnapshotViaService(
+          env,
+          runtimeUpdates ? { runtimeUpdates } : undefined,
+        ).catch(async (err) => {
           console.warn('homepage snapshot: service refresh failed', err);
           await refreshHomepageSnapshotInline(env, now).catch((fallbackErr) => {
             console.warn('homepage snapshot: refresh failed', fallbackErr);
@@ -1110,5 +1124,5 @@ export async function runScheduledTick(env: Env, ctx: ExecutionContext): Promise
     );
   }
 
-  ctx.waitUntil(queueHomepageRefresh());
+  ctx.waitUntil(queueHomepageRefresh(runtimeUpdates));
 }

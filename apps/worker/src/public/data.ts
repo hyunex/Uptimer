@@ -1298,8 +1298,11 @@ export async function listVisibleMaintenanceWindows(
   return { active, upcoming };
 }
 
-export async function readPublicSiteSettings(db: D1Database) {
-  return readSettings(db);
+export async function readPublicSiteSettings(
+  db: D1Database,
+  opts?: { bypassCache?: boolean },
+) {
+  return readSettings(db, opts);
 }
 
 export function buildPublicStatusBanner(opts: {

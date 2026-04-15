@@ -33,6 +33,19 @@ function buildInternalRefreshResponse(ok: boolean, refreshed: boolean): Response
 
 const internalRefreshJsonBodySchema = z.object({
   token: z.string(),
+  runtime_updates: z
+    .array(
+      z.object({
+        monitor_id: z.number().int().positive(),
+        interval_sec: z.number().int().positive(),
+        created_at: z.number().int().nonnegative(),
+        checked_at: z.number().int().nonnegative(),
+        check_status: z.string().nullable(),
+        next_status: z.string().nullable(),
+        latency_ms: z.number().nullable(),
+      }),
+    )
+    .optional(),
 });
 
 const internalScheduledCheckBatchJsonBodySchema = z.object({
@@ -78,6 +91,17 @@ async function handleInternalHomepageRefresh(request: Request, env: Env): Promis
   }
 
   let token = '';
+  let runtimeUpdates:
+    | Array<{
+        monitor_id: number;
+        interval_sec: number;
+        created_at: number;
+        checked_at: number;
+        check_status: string | null;
+        next_status: string | null;
+        latency_ms: number | null;
+      }>
+    | undefined;
   const contentType = request.headers.get('Content-Type') ?? '';
 
   if (contentType.includes('application/json')) {
@@ -89,6 +113,7 @@ async function handleInternalHomepageRefresh(request: Request, env: Env): Promis
     }
 
     token = parsedBody.data.token.trim();
+    runtimeUpdates = parsedBody.data.runtime_updates;
   } else {
     token = (await request.text()).trim();
   }
@@ -213,18 +238,44 @@ async function handleInternalHomepageRefresh(request: Request, env: Env): Promis
           )
         : import('./snapshots/public-homepage'),
     ]);
-    const computed = trace
-      ? await trace.timeAsync(
-          'homepage_refresh_compute',
-          async () =>
-            await homepageMod.computePublicHomepagePayload(env.DB, now, {
-              trace,
+    const fastComputed =
+      skipInitialFreshnessCheck && baseSnapshot.bodyJson
+        ? trace
+          ? await trace.timeAsync(
+              'homepage_refresh_fast_compute',
+              async () =>
+                await homepageMod.tryComputePublicHomepagePayloadFromScheduledRuntimeUpdates({
+                  db: env.DB,
+                  now,
+                  baseSnapshotBodyJson: baseSnapshot.bodyJson,
+                  updates: runtimeUpdates ?? [],
+                  trace,
+                }),
+            )
+          : await homepageMod.tryComputePublicHomepagePayloadFromScheduledRuntimeUpdates({
+              db: env.DB,
+              now,
               baseSnapshotBodyJson: baseSnapshot.bodyJson,
-            }),
-        )
-      : await homepageMod.computePublicHomepagePayload(env.DB, now, {
-          baseSnapshotBodyJson: baseSnapshot.bodyJson,
-        });
+              updates: runtimeUpdates ?? [],
+            })
+        : null;
+    if (trace?.enabled && fastComputed) {
+      trace.setLabel('fast_path', 'scheduled_runtime');
+    }
+    const computed = fastComputed
+      ? fastComputed
+      : trace
+        ? await trace.timeAsync(
+            'homepage_refresh_compute',
+            async () =>
+              await homepageMod.computePublicHomepagePayload(env.DB, now, {
+                trace,
+                baseSnapshotBodyJson: baseSnapshot.bodyJson,
+              }),
+          )
+        : await homepageMod.computePublicHomepagePayload(env.DB, now, {
+            baseSnapshotBodyJson: baseSnapshot.bodyJson,
+          });
     const payload = trace
       ? trace.time('homepage_refresh_validate', () =>
           snapshotMod.toHomepageSnapshotPayload(computed),
