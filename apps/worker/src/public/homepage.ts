@@ -52,6 +52,14 @@ type MaintenancePreview = NonNullable<PublicHomepageResponse['maintenance_histor
 type HomepageMonitorCard = PublicHomepageResponse['monitors'][number];
 type HomepageMonitorStatus = HomepageMonitorCard['status'];
 type HomepagePublicSettings = Awaited<ReturnType<typeof readPublicSiteSettings>>;
+const HOMEPAGE_FAST_PUBLIC_LOCALES = new Set<HomepagePublicSettings['site_locale']>([
+  'auto',
+  'en',
+  'zh-CN',
+  'zh-TW',
+  'ja',
+  'es',
+]);
 
 type HomepageMonitorRow = {
   id: number;
@@ -151,6 +159,66 @@ function hasMatchingHomepagePublicSettings(
     snapshot.site_timezone === settings.site_timezone &&
     snapshot.uptime_rating_level === settings.uptime_rating_level
   );
+}
+
+function normalizeHomepageFastGuardString(
+  value: string | null | undefined,
+  opts: {
+    fallback: string;
+    max: number;
+    allowEmpty?: boolean;
+  },
+): string {
+  if (typeof value !== 'string') {
+    return opts.fallback;
+  }
+  if (!opts.allowEmpty && value.length === 0) {
+    return opts.fallback;
+  }
+  if (value.length > opts.max) {
+    return opts.fallback;
+  }
+  return value;
+}
+
+function normalizeHomepageFastGuardSettings(row: {
+  site_title_value: string | null | undefined;
+  site_description_value: string | null | undefined;
+  site_locale_value: string | null | undefined;
+  site_timezone_value: string | null | undefined;
+  uptime_rating_level_value: string | null | undefined;
+}): HomepagePublicSettings {
+  const parsedUptimeRating = Number.parseInt(row.uptime_rating_level_value ?? '', 10);
+
+  return {
+    site_title: normalizeHomepageFastGuardString(row.site_title_value, {
+      fallback: 'Uptimer',
+      max: 100,
+    }),
+    site_description: normalizeHomepageFastGuardString(row.site_description_value, {
+      fallback: '',
+      max: 500,
+      allowEmpty: true,
+    }),
+    site_locale: HOMEPAGE_FAST_PUBLIC_LOCALES.has(
+      (row.site_locale_value ?? '') as HomepagePublicSettings['site_locale'],
+    )
+      ? ((row.site_locale_value ?? 'auto') as HomepagePublicSettings['site_locale'])
+      : 'auto',
+    site_timezone: normalizeHomepageFastGuardString(row.site_timezone_value, {
+      fallback: 'UTC',
+      max: 64,
+    }),
+    retention_check_results_days: 7,
+    state_failures_to_down_from_up: 2,
+    state_successes_to_up_from_down: 2,
+    admin_default_overview_range: '24h',
+    admin_default_monitor_range: '24h',
+    uptime_rating_level:
+      Number.isFinite(parsedUptimeRating) && parsedUptimeRating >= 1 && parsedUptimeRating <= 5
+        ? (parsedUptimeRating as 1 | 2 | 3 | 4 | 5)
+        : 3,
+  };
 }
 
 function hasCompatibleBaseSnapshotMonitorMetadataStamp(
@@ -1571,6 +1639,7 @@ async function readHomepageScheduledFastGuardState(
   now: number,
   includeHiddenMonitors: boolean,
 ): Promise<{
+  settings: HomepagePublicSettings;
   monitorMetadataStamp: HomepageMonitorMetadataStamp;
   hasActiveIncidents: boolean;
   hasActiveMaintenance: boolean;
@@ -1585,6 +1654,31 @@ async function readHomepageScheduledFastGuardState(
     .prepare(
       `
       SELECT
+        (
+          SELECT value
+          FROM settings
+          WHERE key = 'site_title'
+        ) AS site_title_value,
+        (
+          SELECT value
+          FROM settings
+          WHERE key = 'site_description'
+        ) AS site_description_value,
+        (
+          SELECT value
+          FROM settings
+          WHERE key = 'site_locale'
+        ) AS site_locale_value,
+        (
+          SELECT value
+          FROM settings
+          WHERE key = 'site_timezone'
+        ) AS site_timezone_value,
+        (
+          SELECT value
+          FROM settings
+          WHERE key = 'uptime_rating_level'
+        ) AS uptime_rating_level_value,
         (
           SELECT COUNT(*)
           FROM monitors m
@@ -1636,6 +1730,11 @@ async function readHomepageScheduledFastGuardState(
     )
     .bind(now)
     .first<{
+      site_title_value: string | null;
+      site_description_value: string | null;
+      site_locale_value: string | null;
+      site_timezone_value: string | null;
+      uptime_rating_level_value: string | null;
       monitor_count_total: number | null;
       max_updated_at: number | null;
       has_active_incidents: number | null;
@@ -1646,6 +1745,13 @@ async function readHomepageScheduledFastGuardState(
     }>();
 
   return {
+    settings: normalizeHomepageFastGuardSettings({
+      site_title_value: row?.site_title_value,
+      site_description_value: row?.site_description_value,
+      site_locale_value: row?.site_locale_value,
+      site_timezone_value: row?.site_timezone_value,
+      uptime_rating_level_value: row?.uptime_rating_level_value,
+    }),
     monitorMetadataStamp: {
       monitorCountTotal: row?.monitor_count_total ?? 0,
       maxUpdatedAt: row?.max_updated_at ?? null,
@@ -1671,14 +1777,10 @@ export async function tryComputePublicHomepagePayloadFromScheduledRuntimeUpdates
   }
 
   const includeHiddenMonitors = false;
-  const [settings, guardState] = await Promise.all([
-    withTraceAsync(opts.trace, 'homepage_refresh_fast_settings', async () =>
-      await readPublicSiteSettings(opts.db, { bypassCache: true }),
-    ),
-    withTraceAsync(opts.trace, 'homepage_refresh_fast_static_presence', async () =>
+  const guardState = await withTraceAsync(opts.trace, 'homepage_refresh_fast_guard', async () =>
       await readHomepageScheduledFastGuardState(opts.db, opts.now, includeHiddenMonitors),
-    ),
-  ]);
+  );
+  const settings = guardState.settings;
 
   if (!hasMatchingHomepagePublicSettings(baseSnapshot, settings)) {
     return null;

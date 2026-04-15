@@ -22,8 +22,14 @@ const READ_SNAPSHOT_METADATA_SQL = `
   FROM public_snapshots
   WHERE key = ?1
 `;
+const READ_REFRESH_SNAPSHOT_ROWS_SQL = `
+  SELECT key, generated_at, updated_at, body_json
+  FROM public_snapshots
+  WHERE key = ?1 OR key = ?2
+`;
 const readSnapshotStatementByDb = new WeakMap<D1Database, D1PreparedStatement>();
 const readSnapshotMetadataStatementByDb = new WeakMap<D1Database, D1PreparedStatement>();
+const readRefreshSnapshotRowsStatementByDb = new WeakMap<D1Database, D1PreparedStatement>();
 const normalizedHomepagePayloadCacheByDb = new WeakMap<
   D1Database,
   Map<SnapshotKey, NormalizedSnapshotRow>
@@ -36,6 +42,11 @@ const normalizedHomepageArtifactCacheByDb = new WeakMap<
 type SnapshotRow = {
   generated_at: number;
   body_json: string;
+};
+
+type SnapshotRefreshRow = SnapshotRow & {
+  key: SnapshotKey;
+  updated_at?: number | null;
 };
 
 type SnapshotMetadataRow = {
@@ -237,6 +248,26 @@ async function readSnapshotMetadataRow(
   }
 }
 
+async function readRefreshSnapshotRows(
+  db: D1Database,
+): Promise<SnapshotRefreshRow[]> {
+  try {
+    const cached = readRefreshSnapshotRowsStatementByDb.get(db);
+    const statement = cached ?? db.prepare(READ_REFRESH_SNAPSHOT_ROWS_SQL);
+    if (!cached) {
+      readRefreshSnapshotRowsStatementByDb.set(db, statement);
+    }
+
+    const { results } = await statement
+      .bind(SNAPSHOT_KEY, SNAPSHOT_ARTIFACT_KEY)
+      .all<SnapshotRefreshRow>();
+    return results ?? [];
+  } catch (err) {
+    console.warn('homepage snapshot: refresh rows read failed', err);
+    return [];
+  }
+}
+
 function comparePayloadCandidates(a: SnapshotCandidate, b: SnapshotCandidate): number {
   if (a.generatedAt !== b.generatedAt) {
     return b.generatedAt - a.generatedAt;
@@ -376,9 +407,56 @@ export async function readHomepageRefreshBaseSnapshot(
   bodyJson: string | null;
   seedDataSnapshot: boolean;
 }> {
-  const candidates = (await listSnapshotCandidates(db)).sort(comparePayloadCandidates);
-  const { row: sameDayBase, invalid: sameDayInvalid } = await readFirstValidPayloadCandidate(
-    db,
+  const refreshRows = await readRefreshSnapshotRows(db);
+  const candidates = refreshRows
+    .map((row) => ({
+      key: row.key,
+      generatedAt: row.generated_at,
+      updatedAt: toSnapshotUpdatedAt(row),
+    }))
+    .sort(comparePayloadCandidates);
+  const rowByKey = new Map(refreshRows.map((row) => [row.key, row]));
+  const readRefreshCandidate = async (
+    candidateList: readonly SnapshotCandidate[],
+  ): Promise<{ row: NormalizedSnapshotRow | null; invalid: boolean }> => {
+    let invalid = false;
+
+    for (const candidate of candidateList) {
+      const cached = readCachedNormalizedSnapshotRow(
+        normalizedHomepagePayloadCacheByDb,
+        db,
+        candidate,
+      );
+      if (cached) {
+        return { row: cached, invalid };
+      }
+
+      const row = rowByKey.get(candidate.key);
+      if (!row || row.generated_at !== candidate.generatedAt) {
+        continue;
+      }
+
+      const bodyJson = normalizeHomepagePayloadBodyJson(row.body_json);
+      if (!bodyJson) {
+        invalid = true;
+        continue;
+      }
+
+      return {
+        row: writeCachedNormalizedSnapshotRow(
+          normalizedHomepagePayloadCacheByDb,
+          db,
+          candidate,
+          bodyJson,
+        ),
+        invalid,
+      };
+    }
+
+    return { row: null, invalid };
+  };
+
+  const { row: sameDayBase, invalid: sameDayInvalid } = await readRefreshCandidate(
     candidates.filter((candidate) => isSameUtcDay(candidate.generatedAt, now)),
   );
   if (sameDayBase) {
@@ -389,10 +467,7 @@ export async function readHomepageRefreshBaseSnapshot(
     };
   }
 
-  const { row: freshestBase, invalid: freshestInvalid } = await readFirstValidPayloadCandidate(
-    db,
-    candidates,
-  );
+  const { row: freshestBase, invalid: freshestInvalid } = await readRefreshCandidate(candidates);
   if (freshestBase) {
     return {
       generatedAt: freshestBase.generatedAt,

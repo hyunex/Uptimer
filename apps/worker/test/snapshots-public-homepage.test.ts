@@ -455,6 +455,23 @@ describe('snapshots/public-homepage', () => {
     const artifactPayload = samplePayload(now - 60);
     const db = createFakeD1Database([
       {
+        match: 'select key, generated_at, updated_at, body_json from public_snapshots',
+        all: () => [
+          {
+            key: 'homepage',
+            generated_at: payload.generated_at,
+            updated_at: payload.generated_at,
+            body_json: JSON.stringify(payload),
+          },
+          {
+            key: 'homepage:artifact',
+            generated_at: artifactPayload.generated_at,
+            updated_at: artifactPayload.generated_at,
+            body_json: JSON.stringify(buildHomepageRenderArtifact(artifactPayload)),
+          },
+        ],
+      },
+      {
         match: 'from public_snapshots',
         first: (args) => {
           if (args[0] === 'homepage') {
