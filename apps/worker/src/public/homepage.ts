@@ -1883,11 +1883,13 @@ export async function tryComputePublicHomepagePayloadFromScheduledRuntimeUpdates
   }
 
   const includeHiddenMonitors = false;
+  const guardStart = performance.now();
   const guardState = await withTraceAsync(
     opts.trace,
     'homepage_refresh_fast_guard',
     async () => await readHomepageScheduledFastGuardState(opts.db, opts.now, includeHiddenMonitors),
   );
+  const guardDurMs = performance.now() - guardStart;
   const settings = guardState.settings;
 
   if (!hasMatchingHomepagePublicSettings(baseSnapshot, settings)) {
@@ -1930,6 +1932,7 @@ export async function tryComputePublicHomepagePayloadFromScheduledRuntimeUpdates
     return null;
   }
 
+  const patchStart = performance.now();
   const patched = withTraceSync(opts.trace, 'homepage_refresh_fast_patch', () =>
     tryPatchPublicHomepagePayloadFromRuntimeUpdates({
       baseSnapshot,
@@ -1937,8 +1940,11 @@ export async function tryComputePublicHomepagePayloadFromScheduledRuntimeUpdates
       updates: opts.updates,
     }),
   );
+  const patchDurMs = performance.now() - patchStart;
   if (patched) {
-    console.log(`homepage refresh fast compute: patched_direct monitors=${patched.monitors.length}`);
+    console.log(
+      `homepage refresh fast compute: patched_direct monitors=${patched.monitors.length} guard_ms=${guardDurMs.toFixed(2)} patch_ms=${patchDurMs.toFixed(2)}`,
+    );
     return patched;
   }
 

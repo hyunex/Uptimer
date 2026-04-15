@@ -217,12 +217,14 @@ async function handleInternalHomepageRefresh(request: Request, env: Env): Promis
     }
     claimedLeaseExpiresAt = now + HOMEPAGE_REFRESH_LOCK_LEASE_SECONDS;
 
+    const baseReadStart = performance.now();
     const baseSnapshot = trace
       ? await trace.timeAsync(
           'homepage_refresh_read_snapshot_base',
           async () => await readHomepageRefreshBaseSnapshot(env.DB, now),
         )
       : await readHomepageRefreshBaseSnapshot(env.DB, now);
+    const baseReadDurMs = performance.now() - baseReadStart;
     if (baseSnapshot.generatedAt !== null && isSameMinute(baseSnapshot.generatedAt, now)) {
       if (trace?.enabled) {
         trace.setLabel('skip', 'fresh_after_lease');
@@ -274,7 +276,9 @@ async function handleInternalHomepageRefresh(request: Request, env: Env): Promis
     }
     if (payload === null) {
       if (skipInitialFreshnessCheck) {
-        console.log('homepage refresh fast compute: full_compute_fallback reason=fast_path_miss');
+        console.log(
+          `homepage refresh fast compute: full_compute_fallback reason=fast_path_miss base_read_ms=${baseReadDurMs.toFixed(2)}`,
+        );
       }
       const computed = trace
         ? await trace.timeAsync(
@@ -291,6 +295,9 @@ async function handleInternalHomepageRefresh(request: Request, env: Env): Promis
             baseSnapshotBodyJson: null,
           });
       payload = computed;
+    }
+    if (skipInitialFreshnessCheck) {
+      console.log(`homepage refresh base read timing: ms=${baseReadDurMs.toFixed(2)}`);
     }
     const validatedPayload = trace
       ? trace.time('homepage_refresh_validate', () => snapshotMod.toHomepageSnapshotPayload(payload))

@@ -785,15 +785,22 @@ export async function writeHomepageSnapshot(
   trace?: Trace,
   _seedDataSnapshot = false,
 ): Promise<void> {
+  const payloadStringifyStart = performance.now();
   const payloadBodyJson = withTraceSync(trace, 'homepage_write_stringify_payload', () =>
     JSON.stringify(payload),
   );
+  const payloadStringifyDurMs = performance.now() - payloadStringifyStart;
+  const renderStart = performance.now();
   const render = withTraceSync(trace, 'homepage_write_render', () =>
     buildHomepageRenderArtifact(payload, payloadBodyJson),
   );
+  const renderDurMs = performance.now() - renderStart;
+  const artifactStringifyStart = performance.now();
   const renderBodyJson = withTraceSync(trace, 'homepage_write_stringify_artifact', () =>
     JSON.stringify(render),
   );
+  const artifactStringifyDurMs = performance.now() - artifactStringifyStart;
+  const batchStart = performance.now();
 
   await withTraceAsync(trace, 'homepage_write_batch', async () => {
     const statements = [
@@ -815,6 +822,11 @@ export async function writeHomepageSnapshot(
 
     await db.batch(statements);
   });
+  const batchDurMs = performance.now() - batchStart;
+
+  console.log(
+    `homepage refresh write timings: payload_ms=${payloadStringifyDurMs.toFixed(2)} render_ms=${renderDurMs.toFixed(2)} artifact_ms=${artifactStringifyDurMs.toFixed(2)} batch_ms=${batchDurMs.toFixed(2)}`,
+  );
 
   primeHomepageRefreshBaseSnapshotCache({
     db,
