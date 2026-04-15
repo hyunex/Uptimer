@@ -1535,12 +1535,12 @@ function computePatchedHomepageSegmentTotals(opts: {
   }
 
   const totalSec = opts.segmentEnd - opts.segmentStart;
-  if (opts.isStale || opts.status === 'unknown' || opts.lastCheckedAt === null) {
-    return { downtimeSec: 0, unknownSec: totalSec };
-  }
-
   if (opts.status === 'down') {
     return { downtimeSec: totalSec, unknownSec: 0 };
+  }
+
+  if (opts.isStale || opts.status === 'unknown' || opts.lastCheckedAt === null) {
+    return { downtimeSec: 0, unknownSec: totalSec };
   }
 
   const validUntil = opts.lastCheckedAt + Math.max(0, opts.intervalSec) * 2;
@@ -1607,7 +1607,7 @@ export function tryPatchPublicHomepagePayloadFromRuntimeUpdates(opts: {
   if (Math.max(0, now - baseSnapshot.generated_at) > HOMEPAGE_FAST_PATCH_BASE_MAX_AGE_SECONDS) {
     return null;
   }
-  if (updates.length === 0 || updates.length > baseSnapshot.monitors.length) {
+  if (updates.length === 0 || updates.length !== baseSnapshot.monitors.length) {
     return null;
   }
 
@@ -1627,15 +1627,16 @@ export function tryPatchPublicHomepagePayloadFromRuntimeUpdates(opts: {
     }
     updateById.set(update.monitor_id, update);
   }
+  if (updateById.size !== baseSnapshot.monitors.length) {
+    return null;
+  }
 
   const todayStartAt = utcDayStart(now);
-  let appliedUpdates = 0;
   const nextMonitors = baseSnapshot.monitors.map((monitor) => {
     const update = updateById.get(monitor.id);
     if (!update) {
-      return monitor;
+      return null;
     }
-    appliedUpdates += 1;
     if (monitor.last_checked_at !== null && update.checked_at <= monitor.last_checked_at) {
       return null;
     }
@@ -1720,7 +1721,7 @@ export function tryPatchPublicHomepagePayloadFromRuntimeUpdates(opts: {
     return nextMonitor;
   });
 
-  if (nextMonitors.some((monitor) => monitor === null) || appliedUpdates !== updateById.size) {
+  if (nextMonitors.some((monitor) => monitor === null)) {
     return null;
   }
 
@@ -2012,8 +2013,8 @@ export async function tryComputePublicHomepagePayloadFromScheduledRuntimeUpdates
       active: [],
       upcoming: [],
     },
-    resolved_incident_preview: baseSnapshot.resolved_incident_preview,
-    maintenance_history_preview: baseSnapshot.maintenance_history_preview,
+    resolved_incident_preview: null,
+    maintenance_history_preview: null,
   };
 }
 
