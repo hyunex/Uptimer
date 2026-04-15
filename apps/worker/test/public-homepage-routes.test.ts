@@ -317,7 +317,14 @@ describe('public homepage route', () => {
     expect(first.headers.get('Access-Control-Allow-Origin')).toBe('https://one.example.com');
     expect(second.headers.get('Access-Control-Allow-Origin')).toBe('https://two.example.com');
     expect(third.headers.get('Access-Control-Allow-Origin')).toBe('https://one.example.com');
-    expect(dbReads).toEqual(['homepage', 'homepage', 'homepage']);
+    expect(dbReads).toEqual([
+      'homepage:artifact',
+      'homepage',
+      'homepage:artifact',
+      'homepage',
+      'homepage:artifact',
+      'homepage',
+    ]);
   });
 
   it('serves a slightly stale homepage snapshot via the worker hot path', async () => {
@@ -342,7 +349,7 @@ describe('public homepage route', () => {
 
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual(payload);
-    expect(dbReads).toEqual(['homepage']);
+    expect(dbReads).toEqual(['homepage:artifact', 'homepage']);
     expect(res.headers.get('Cache-Control')).toContain('max-age=0');
   });
 

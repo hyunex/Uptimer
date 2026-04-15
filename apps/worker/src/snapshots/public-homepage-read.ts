@@ -80,6 +80,30 @@ function safeJsonParse(text: string): unknown | null {
   }
 }
 
+function snapshotBodyJsonFromParsed(value: unknown): string | null {
+  if (looksLikeHomepagePayload(value)) {
+    return JSON.stringify(value);
+  }
+
+  if (looksLikeHomepageArtifact(value) && isRecord(value)) {
+    return JSON.stringify(value.snapshot);
+  }
+
+  if (!isRecord(value)) {
+    return null;
+  }
+
+  const version = value.version;
+  if (version === SPLIT_SNAPSHOT_VERSION || version === LEGACY_COMBINED_SNAPSHOT_VERSION) {
+    const data = value.data;
+    if (looksLikeHomepagePayload(data)) {
+      return JSON.stringify(data);
+    }
+  }
+
+  return null;
+}
+
 async function readSnapshotRow(
   db: D1Database,
   key: string,
@@ -115,7 +139,10 @@ async function readSnapshotGeneratedAt(db: D1Database, key: string): Promise<num
 }
 
 export async function readHomepageSnapshotGeneratedAt(db: D1Database): Promise<number | null> {
-  return await readSnapshotGeneratedAt(db, SNAPSHOT_KEY);
+  return (
+    (await readSnapshotGeneratedAt(db, SNAPSHOT_ARTIFACT_KEY)) ??
+    (await readSnapshotGeneratedAt(db, SNAPSHOT_KEY))
+  );
 }
 
 export async function readHomepageArtifactSnapshotGeneratedAt(
@@ -143,7 +170,8 @@ export async function readHomepageSnapshotJsonAnyAge(
   now: number,
   maxStaleSeconds = MAX_STALE_SECONDS,
 ): Promise<{ bodyJson: string; age: number } | null> {
-  const row = await readSnapshotRow(db, SNAPSHOT_KEY);
+  const row =
+    (await readSnapshotRow(db, SNAPSHOT_ARTIFACT_KEY)) ?? (await readSnapshotRow(db, SNAPSHOT_KEY));
   if (!row) return null;
 
   const age = Math.max(0, now - row.generated_at);
@@ -155,23 +183,13 @@ export async function readHomepageSnapshotJsonAnyAge(
 
   const parsed = safeJsonParse(row.body_json);
   if (parsed === null) return null;
-
-  if (looksLikeHomepagePayload(parsed)) {
-    return { bodyJson: JSON.stringify(parsed), age };
+  const bodyJson = snapshotBodyJsonFromParsed(parsed);
+  if (!bodyJson) {
+    console.warn('homepage snapshot: invalid payload');
+    return null;
   }
 
-  if (isRecord(parsed)) {
-    const version = parsed.version;
-    if (version === SPLIT_SNAPSHOT_VERSION || version === LEGACY_COMBINED_SNAPSHOT_VERSION) {
-      const data = parsed.data;
-      if (looksLikeHomepagePayload(data)) {
-        return { bodyJson: JSON.stringify(data), age };
-      }
-    }
-  }
-
-  console.warn('homepage snapshot: invalid payload');
-  return null;
+  return { bodyJson, age };
 }
 
 export async function readHomepageSnapshotJson(

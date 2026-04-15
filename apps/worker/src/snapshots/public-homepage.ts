@@ -431,6 +431,10 @@ function looksLikeSerializedHomepageArtifact(text: string): boolean {
 }
 
 function readStoredHomepageSnapshotData(value: unknown): PublicHomepageResponse | null {
+  if (looksLikeHomepageArtifact(value)) {
+    return value.snapshot;
+  }
+
   if (!isRecord(value)) return null;
 
   const version = value.version;
@@ -542,7 +546,7 @@ export async function readHomepageSnapshot(
   db: D1Database,
   now: number,
 ): Promise<{ data: PublicHomepageResponse; age: number } | null> {
-  const row = await readHomepageSnapshotRow(db);
+  const row = (await readHomepageArtifactSnapshotRow(db)) ?? (await readHomepageSnapshotRow(db));
   if (!row) return null;
 
   const age = Math.max(0, now - row.generated_at);
@@ -567,7 +571,7 @@ export async function readHomepageSnapshotJson(
   db: D1Database,
   now: number,
 ): Promise<{ bodyJson: string; age: number } | null> {
-  const row = await readHomepageSnapshotRow(db);
+  const row = (await readHomepageArtifactSnapshotRow(db)) ?? (await readHomepageSnapshotRow(db));
   if (!row) return null;
 
   const age = Math.max(0, now - row.generated_at);
@@ -599,7 +603,7 @@ export async function readStaleHomepageSnapshot(
   db: D1Database,
   now: number,
 ): Promise<{ data: PublicHomepageResponse; age: number } | null> {
-  const row = await readHomepageSnapshotRow(db);
+  const row = (await readHomepageArtifactSnapshotRow(db)) ?? (await readHomepageSnapshotRow(db));
   if (!row) return null;
 
   const age = Math.max(0, now - row.generated_at);
@@ -624,7 +628,7 @@ export async function readStaleHomepageSnapshotJson(
   db: D1Database,
   now: number,
 ): Promise<{ bodyJson: string; age: number } | null> {
-  const row = await readHomepageSnapshotRow(db);
+  const row = (await readHomepageArtifactSnapshotRow(db)) ?? (await readHomepageSnapshotRow(db));
   if (!row) return null;
 
   const age = Math.max(0, now - row.generated_at);
@@ -769,7 +773,10 @@ export async function readStaleHomepageSnapshotArtifactJson(
 export async function readHomepageSnapshotGeneratedAt(
   db: D1Database,
 ): Promise<number | null> {
-  return await readSnapshotGeneratedAt(db, SNAPSHOT_KEY);
+  return (
+    (await readSnapshotGeneratedAt(db, SNAPSHOT_ARTIFACT_KEY)) ??
+    (await readSnapshotGeneratedAt(db, SNAPSHOT_KEY))
+  );
 }
 
 export async function readHomepageArtifactSnapshotGeneratedAt(
@@ -806,24 +813,18 @@ export async function writeHomepageSnapshot(
   const render = withTraceSync(trace, 'homepage_write_render', () =>
     buildHomepageRenderArtifact(payload),
   );
-  const dataBodyJson = withTraceSync(trace, 'homepage_write_stringify_data', () =>
-    JSON.stringify(payload),
-  );
   const renderBodyJson = withTraceSync(trace, 'homepage_write_stringify_artifact', () =>
     JSON.stringify(render),
   );
 
   await withTraceAsync(trace, 'homepage_write_batch', async () =>
-    await db.batch([
-      homepageSnapshotUpsertStatement(db, SNAPSHOT_KEY, payload.generated_at, dataBodyJson, now),
-      homepageSnapshotUpsertStatement(
-        db,
-        SNAPSHOT_ARTIFACT_KEY,
-        render.generated_at,
-        renderBodyJson,
-        now,
-      ),
-    ]),
+    await homepageSnapshotUpsertStatement(
+      db,
+      SNAPSHOT_ARTIFACT_KEY,
+      render.generated_at,
+      renderBodyJson,
+      now,
+    ).run(),
   );
 }
 
