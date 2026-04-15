@@ -174,39 +174,41 @@ async function handleInternalHomepageRefresh(request: Request, env: Env): Promis
       }
     }
 
-    const { acquireLease } = trace
-      ? await trace.timeAsync(
-          'import_scheduler_lock_module',
-          async () => await import('./scheduler/lock'),
-        )
-      : await import('./scheduler/lock');
-    const acquired = trace
-      ? await trace.timeAsync(
-          'homepage_refresh_lease',
-          async () =>
-            await acquireLease(
-              env.DB,
-              HOMEPAGE_REFRESH_LOCK_NAME,
-              now,
-              HOMEPAGE_REFRESH_LOCK_LEASE_SECONDS,
-            ),
-        )
-      : await acquireLease(
-          env.DB,
-          HOMEPAGE_REFRESH_LOCK_NAME,
-          now,
-          HOMEPAGE_REFRESH_LOCK_LEASE_SECONDS,
+    if (!skipInitialFreshnessCheck) {
+      const { acquireLease } = trace
+        ? await trace.timeAsync(
+            'import_scheduler_lock_module',
+            async () => await import('./scheduler/lock'),
+          )
+        : await import('./scheduler/lock');
+      const acquired = trace
+        ? await trace.timeAsync(
+            'homepage_refresh_lease',
+            async () =>
+              await acquireLease(
+                env.DB,
+                HOMEPAGE_REFRESH_LOCK_NAME,
+                now,
+                HOMEPAGE_REFRESH_LOCK_LEASE_SECONDS,
+              ),
+          )
+        : await acquireLease(
+            env.DB,
+            HOMEPAGE_REFRESH_LOCK_NAME,
+            now,
+            HOMEPAGE_REFRESH_LOCK_LEASE_SECONDS,
+          );
+      if (!acquired) {
+        if (trace?.enabled) {
+          trace.setLabel('skip', 'lease');
+        }
+        return finalizeInternalRefreshResponse(
+          buildInternalRefreshResponse(true, false),
+          trace,
+          traceMod,
+          { refreshed: false },
         );
-    if (!acquired) {
-      if (trace?.enabled) {
-        trace.setLabel('skip', 'lease');
       }
-      return finalizeInternalRefreshResponse(
-        buildInternalRefreshResponse(true, false),
-        trace,
-        traceMod,
-        { refreshed: false },
-      );
     }
 
     const baseSnapshot = trace
