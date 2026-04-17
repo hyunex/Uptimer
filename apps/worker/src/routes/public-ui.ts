@@ -18,10 +18,8 @@ import {
   MONITOR_RUNTIME_MAX_AGE_SECONDS,
   MONITOR_RUNTIME_SNAPSHOT_KEY,
   parsePublicMonitorRuntimeEntryJson,
-  readPublicMonitorRuntimeTotalsSnapshot,
-  totalsSnapshotHasMonitorIds,
-  toMonitorRuntimeTotalsEntryMap,
 } from '../public/monitor-runtime';
+import { readPublicUptimeOverviewSnapshotJson } from '../snapshots/public-uptime-overview';
 import {
   buildNumberedPlaceholders,
   chunkPositiveIntegerIds,
@@ -1381,122 +1379,30 @@ publicUiRoutes.get('/analytics/uptime', async (c) => {
   trace.setLabel('range', range);
 
   const now = Math.floor(Date.now() / 1000);
-  const rangeEnd = Math.floor(now / 60) * 60;
-  const rangeEndFullDays = utcDayStart(rangeEnd);
-  const rangeStart = rangeEnd - (range === '30d' ? 30 * 86400 : 90 * 86400);
-
-  const { results: monitorRows } = await trace.timeAsync(
-    'monitor_rollups',
-    async () =>
-      await preparePublicUiStatement(
-        c.env.DB,
-        `
-          SELECT
-            m.id,
-            m.name,
-            m.type,
-            COALESCE(SUM(r.total_sec), 0) AS rollup_total_sec,
-            COALESCE(SUM(r.downtime_sec), 0) AS rollup_downtime_sec,
-            COALESCE(SUM(r.unknown_sec), 0) AS rollup_unknown_sec,
-            COALESCE(SUM(r.uptime_sec), 0) AS rollup_uptime_sec
-          FROM monitors m
-          LEFT JOIN monitor_daily_rollups r
-            ON r.monitor_id = m.id
-           AND r.day_start_at >= ?1
-           AND r.day_start_at < ?2
-          WHERE m.is_active = 1
-            AND ${monitorVisibilityPredicate(includeHiddenMonitors, 'm')}
-          GROUP BY m.id, m.name, m.type
-          ORDER BY m.id
-        `,
-      )
-        .bind(rangeStart, rangeEndFullDays)
-        .all<{
-          id: number;
-          name: string;
-          type: string;
-          rollup_total_sec: number | null;
-          rollup_downtime_sec: number | null;
-          rollup_unknown_sec: number | null;
-          rollup_uptime_sec: number | null;
-        }>(),
-  );
-
-  const monitors = monitorRows ?? [];
-  const monitorIds = monitors.map((monitor) => monitor.id);
-  const runtimeSnapshot =
-    monitorIds.length > 0
-      ? await trace.timeAsync(
-          'runtime_snapshot',
-          async () => await readPublicMonitorRuntimeTotalsSnapshot(c.env.DB, rangeEnd),
-        )
-      : null;
-  if (monitorIds.length > 0 && (!runtimeSnapshot || !totalsSnapshotHasMonitorIds(runtimeSnapshot, monitorIds))) {
-    const { publicRoutes } = await import('./public');
-    return publicRoutes.fetch(c.req.raw, c.env, c.executionCtx);
+  if (!includeHiddenMonitors) {
+    const snapshot = await trace.timeAsync(
+      'snapshot_read',
+      async () => await readPublicUptimeOverviewSnapshotJson(c.env.DB, range, now),
+    );
+    if (snapshot) {
+      const res = new Response(snapshot.bodyJson, {
+        status: 200,
+        headers: { 'Content-Type': 'application/json; charset=utf-8' },
+      });
+      trace.setLabel('path', 'snapshot');
+      trace.setLabel('age', snapshot.age);
+      trace.setLabel('bytes', snapshot.bodyJson.length);
+      trace.finish('total');
+      applyTraceToResponse({ res, trace, prefix: 'w' });
+      return res;
+    }
   }
 
-  const runtimeByMonitorId = runtimeSnapshot ? toMonitorRuntimeTotalsEntryMap(runtimeSnapshot) : null;
-  let total_sec = 0;
-  let downtime_sec = 0;
-  let unknown_sec = 0;
-  let uptime_sec = 0;
-
-  const partialStart = rangeEndFullDays;
-  const partialEnd = rangeEnd;
-  const output = monitors.map((monitor) => {
-    const rollupTotals = {
-      total_sec: monitor.rollup_total_sec ?? 0,
-      downtime_sec: monitor.rollup_downtime_sec ?? 0,
-      unknown_sec: monitor.rollup_unknown_sec ?? 0,
-      uptime_sec: monitor.rollup_uptime_sec ?? 0,
-    };
-    const partialTotals =
-      partialEnd > partialStart && runtimeByMonitorId
-        ? materializeMonitorRuntimeTotals(runtimeByMonitorId.get(monitor.id)!, partialEnd)
-        : { total_sec: 0, downtime_sec: 0, unknown_sec: 0, uptime_sec: 0, uptime_pct: null };
-
-    const totals = {
-      total_sec: rollupTotals.total_sec + partialTotals.total_sec,
-      downtime_sec: rollupTotals.downtime_sec + partialTotals.downtime_sec,
-      unknown_sec: rollupTotals.unknown_sec + partialTotals.unknown_sec,
-      uptime_sec: rollupTotals.uptime_sec + partialTotals.uptime_sec,
-    };
-
-    total_sec += totals.total_sec;
-    downtime_sec += totals.downtime_sec;
-    unknown_sec += totals.unknown_sec;
-    uptime_sec += totals.uptime_sec;
-
-    return {
-      id: monitor.id,
-      name: monitor.name,
-      type: monitor.type,
-      total_sec: totals.total_sec,
-      downtime_sec: totals.downtime_sec,
-      unknown_sec: totals.unknown_sec,
-      uptime_sec: totals.uptime_sec,
-      uptime_pct: totals.total_sec === 0 ? 0 : (totals.uptime_sec / totals.total_sec) * 100,
-    };
-  });
-
-  const res = withVisibilityAwareCaching(
-    c.json({
-      generated_at: now,
-      range,
-      range_start_at: rangeStart,
-      range_end_at: rangeEnd,
-      overall: {
-        total_sec,
-        downtime_sec,
-        unknown_sec,
-        uptime_sec,
-        uptime_pct: total_sec === 0 ? 0 : (uptime_sec / total_sec) * 100,
-      },
-      monitors: output,
-    }),
-    includeHiddenMonitors,
+  const { publicRoutes } = await import('./public');
+  const res = await trace.timeAsync('live_fallback', async () =>
+    publicRoutes.fetch(c.req.raw, c.env, c.executionCtx),
   );
+  trace.setLabel('path', includeHiddenMonitors ? 'live_admin' : 'live_miss');
   trace.finish('total');
   applyTraceToResponse({ res, trace, prefix: 'w' });
   return res;

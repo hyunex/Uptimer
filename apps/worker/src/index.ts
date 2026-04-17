@@ -352,7 +352,14 @@ async function handleInternalHomepageRefresh(request: Request, env: Env): Promis
       );
     }
 
-    const [homepageMod, snapshotMod, statusMod, statusSnapshotMod] = await Promise.all([
+    const [
+      homepageMod,
+      snapshotMod,
+      statusMod,
+      statusSnapshotMod,
+      uptimeOverviewMod,
+      uptimeOverviewSnapshotMod,
+    ] = await Promise.all([
       trace
         ? trace.timeAsync('import_homepage_module', async () => await import('./public/homepage'))
         : import('./public/homepage'),
@@ -374,6 +381,18 @@ async function handleInternalHomepageRefresh(request: Request, env: Env): Promis
             async () => await import('./snapshots/public-status'),
           )
         : import('./snapshots/public-status'),
+      trace
+        ? trace.timeAsync(
+            'import_uptime_overview_module',
+            async () => await import('./public/uptime-overview'),
+          )
+        : import('./public/uptime-overview'),
+      trace
+        ? trace.timeAsync(
+            'import_uptime_overview_snapshot_module',
+            async () => await import('./snapshots/public-uptime-overview'),
+          )
+        : import('./snapshots/public-uptime-overview'),
     ]);
     let payload =
       skipInitialFreshnessCheck && baseSnapshot.snapshot
@@ -470,6 +489,40 @@ async function handleInternalHomepageRefresh(request: Request, env: Env): Promis
       trace?.setLabel('status_refresh', 'patched');
     } else {
       trace?.setLabel('status_refresh', 'skipped');
+    }
+
+    try {
+      const uptimeOverviewSnapshots = trace
+        ? await trace.timeAsync(
+            'uptime_overview_refresh_compute',
+            async () => await uptimeOverviewMod.computePublicUptimeOverviewSnapshots(env.DB, now),
+          )
+        : await uptimeOverviewMod.computePublicUptimeOverviewSnapshots(env.DB, now);
+      if (uptimeOverviewSnapshots) {
+        if (trace) {
+          await trace.timeAsync(
+            'uptime_overview_refresh_write',
+            async () =>
+              await uptimeOverviewSnapshotMod.writePublicUptimeOverviewSnapshots(
+                env.DB,
+                now,
+                uptimeOverviewSnapshots,
+              ),
+          );
+        } else {
+          await uptimeOverviewSnapshotMod.writePublicUptimeOverviewSnapshots(
+            env.DB,
+            now,
+            uptimeOverviewSnapshots,
+          );
+        }
+        trace?.setLabel('uptime_overview_refresh', 'written');
+      } else {
+        trace?.setLabel('uptime_overview_refresh', 'skipped');
+      }
+    } catch (err) {
+      trace?.setLabel('uptime_overview_refresh', 'error');
+      console.warn('internal refresh: uptime overview snapshot failed', err);
     }
 
     return finalizeInternalRefreshResponse(

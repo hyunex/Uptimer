@@ -121,46 +121,32 @@ describe('public ui routes', () => {
 
     const handlers: FakeD1QueryHandler[] = [
       {
-        match: (sql) =>
-          sql.includes('left join monitor_daily_rollups') && sql.includes('group by m.id, m.name, m.type'),
-        all: () => [
-          {
-            id: 21,
-            name: 'Core API',
-            type: 'http',
-            rollup_total_sec: 0,
-            rollup_downtime_sec: 0,
-            rollup_unknown_sec: 0,
-            rollup_uptime_sec: 0,
-          },
-        ],
-      },
-      {
         match: (sql) => sql.includes('from public_snapshots') && sql.includes("where key = ?1"),
         first: () => ({
-          generated_at: rangeEnd,
-          updated_at: rangeEnd,
+          generated_at: rangeEnd + 10,
+          updated_at: rangeEnd + 10,
           body_json: JSON.stringify({
-            version: 1,
-            generated_at: rangeEnd,
-            day_start_at: dayStart,
+            generated_at: rangeEnd + 10,
+            range: '30d',
+            range_start_at: rangeEnd - 30 * 86_400,
+            range_end_at: rangeEnd,
+            overall: {
+              total_sec: 3_600,
+              downtime_sec: 300,
+              unknown_sec: 0,
+              uptime_sec: 3_300,
+              uptime_pct: (3_300 / 3_600) * 100,
+            },
             monitors: [
               {
-                monitor_id: 21,
-                created_at: dayStart - 10 * 86_400,
-                interval_sec: 60,
-                range_start_at: dayStart,
-                materialized_at: rangeEnd,
-                last_checked_at: rangeEnd,
-                last_status_code: 'u',
-                last_outage_open: false,
+                id: 21,
+                name: 'Core API',
+                type: 'http',
                 total_sec: 3_600,
                 downtime_sec: 300,
                 unknown_sec: 0,
                 uptime_sec: 3_300,
-                heartbeat_gap_sec: '',
-                heartbeat_latency_ms: [120],
-                heartbeat_status_codes: 'u',
+                uptime_pct: (3_300 / 3_600) * 100,
               },
             ],
           }),

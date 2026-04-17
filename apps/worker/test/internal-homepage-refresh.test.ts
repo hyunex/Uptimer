@@ -11,12 +11,18 @@ vi.mock('../src/public/homepage', () => ({
 vi.mock('../src/public/status-refresh', () => ({
   tryComputePublicStatusPayloadFromScheduledRuntimeUpdates: vi.fn(),
 }));
+vi.mock('../src/public/uptime-overview', () => ({
+  computePublicUptimeOverviewSnapshots: vi.fn(),
+}));
 vi.mock('../src/snapshots/public-homepage', () => ({
   toHomepageSnapshotPayload: vi.fn((value) => value),
   writeHomepageSnapshot: vi.fn(),
 }));
 vi.mock('../src/snapshots/public-status', () => ({
   writeStatusSnapshot: vi.fn(),
+}));
+vi.mock('../src/snapshots/public-uptime-overview', () => ({
+  writePublicUptimeOverviewSnapshots: vi.fn(),
 }));
 
 import type { Env } from '../src/env';
@@ -26,9 +32,11 @@ import {
   tryComputePublicHomepagePayloadFromScheduledRuntimeUpdates,
 } from '../src/public/homepage';
 import { tryComputePublicStatusPayloadFromScheduledRuntimeUpdates } from '../src/public/status-refresh';
+import { computePublicUptimeOverviewSnapshots } from '../src/public/uptime-overview';
 import { acquireLease, releaseLease } from '../src/scheduler/lock';
 import { toHomepageSnapshotPayload, writeHomepageSnapshot } from '../src/snapshots/public-homepage';
 import { writeStatusSnapshot } from '../src/snapshots/public-status';
+import { writePublicUptimeOverviewSnapshots } from '../src/snapshots/public-uptime-overview';
 import { createFakeD1Database } from './helpers/fake-d1';
 
 function createBaseSnapshot(now: number) {
@@ -115,6 +123,7 @@ describe('internal homepage refresh route', () => {
     vi.mocked(tryComputePublicStatusPayloadFromScheduledRuntimeUpdates).mockResolvedValue(
       null as never,
     );
+    vi.mocked(computePublicUptimeOverviewSnapshots).mockResolvedValue(null as never);
   });
 
   it('uses the scheduled runtime fast path when available', async () => {
@@ -179,6 +188,7 @@ describe('internal homepage refresh route', () => {
       ],
     });
     expect(writeStatusSnapshot).not.toHaveBeenCalled();
+    expect(writePublicUptimeOverviewSnapshots).not.toHaveBeenCalled();
     expect(releaseLease).toHaveBeenCalledWith(env.DB, 'snapshot:homepage:refresh', now + 55);
     expect(
       vi.mocked(tryComputePublicHomepagePayloadFromScheduledRuntimeUpdates),
@@ -263,6 +273,79 @@ describe('internal homepage refresh route', () => {
 
     expect(res.status).toBe(200);
     expect(writeStatusSnapshot).toHaveBeenCalledWith(env.DB, now, statusPayload);
+  });
+
+  it('writes uptime overview snapshots when refresh data is available', async () => {
+    const now = 1_776_230_340;
+    vi.spyOn(Date, 'now').mockReturnValue(now * 1000);
+    const env = createEnv(now);
+    const baseSnapshot = createBaseSnapshot(now);
+    vi.mocked(tryComputePublicHomepagePayloadFromScheduledRuntimeUpdates).mockResolvedValue(
+      {
+        ...baseSnapshot,
+        generated_at: now,
+      } as never,
+    );
+    vi.mocked(computePublicUptimeOverviewSnapshots).mockResolvedValue(
+      {
+        '30d': {
+          generated_at: now,
+          range: '30d',
+          range_start_at: now - 30 * 86_400,
+          range_end_at: now,
+          overall: {
+            total_sec: 3_600,
+            downtime_sec: 0,
+            unknown_sec: 0,
+            uptime_sec: 3_600,
+            uptime_pct: 100,
+          },
+          monitors: [],
+        },
+        '90d': {
+          generated_at: now,
+          range: '90d',
+          range_start_at: now - 90 * 86_400,
+          range_end_at: now,
+          overall: {
+            total_sec: 3_600,
+            downtime_sec: 0,
+            unknown_sec: 0,
+            uptime_sec: 3_600,
+            uptime_pct: 100,
+          },
+          monitors: [],
+        },
+      } as never,
+    );
+
+    const res = await worker.fetch(
+      new Request('https://status.example.com/api/v1/internal/refresh/homepage', {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer test-admin-token',
+          'Content-Type': 'application/json; charset=utf-8',
+          'X-Uptimer-Refresh-Source': 'scheduled',
+        },
+        body: JSON.stringify({
+          token: 'test-admin-token',
+          runtime_updates: [[1, 60, now - 300, now, 'up', 'up', 55]],
+        }),
+      }),
+      env,
+      { waitUntil: vi.fn() } as unknown as ExecutionContext,
+    );
+
+    expect(res.status).toBe(200);
+    expect(computePublicUptimeOverviewSnapshots).toHaveBeenCalledWith(env.DB, now);
+    expect(writePublicUptimeOverviewSnapshots).toHaveBeenCalledWith(
+      env.DB,
+      now,
+      expect.objectContaining({
+        '30d': expect.objectContaining({ range: '30d' }),
+        '90d': expect.objectContaining({ range: '90d' }),
+      }),
+    );
   });
 
   it('normalizes privileged runtime update latency values before fast-path compute', async () => {
