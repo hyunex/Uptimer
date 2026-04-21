@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
-import { z } from 'zod';
 
 import { utcDayStart } from '../analytics/uptime';
+import { AppError } from '../middleware/errors';
 import type { Env } from '../env';
 import { hasValidAdminTokenRequest } from '../middleware/auth';
 import { cachePublic } from '../middleware/cache-public';
@@ -20,7 +20,6 @@ import {
 } from '../public/monitor-runtime';
 import { monitorVisibilityPredicate } from '../public/visibility';
 
-const uptimeOverviewRangeSchema = z.enum(['30d', '90d']);
 const ACTIVE_MONITOR_CACHE_TTL_MS = 30_000;
 
 type AnalyticsMonitorRow = {
@@ -79,6 +78,16 @@ function normalizeAnalyticsUptimeCacheKeyUrl(url: URL): void {
   if (range === '90d') {
     url.searchParams.set('range', '90d');
   }
+}
+
+function parseAnalyticsUptimeRange(raw: string | undefined): '30d' | '90d' {
+  if (raw === undefined || raw === '30d') {
+    return '30d';
+  }
+  if (raw === '90d') {
+    return '90d';
+  }
+  throw new AppError(400, 'INVALID_ARGUMENT', 'Invalid range');
 }
 
 const statementCacheByDb = new WeakMap<D1Database, Map<string, D1PreparedStatement>>();
@@ -167,7 +176,7 @@ export async function handlePublicAnalyticsUptime(c: {
   json: (data: unknown) => Response;
 }): Promise<Response> {
   const includeHiddenMonitors = isAuthorizedStatusAdminRequest(c);
-  const range = uptimeOverviewRangeSchema.optional().default('30d').parse(c.req.query('range'));
+  const range = parseAnalyticsUptimeRange(c.req.query('range'));
   const trace = createTrace(c);
   trace.setLabel('route', 'public/analytics-uptime');
   trace.setLabel('range', range);
@@ -277,20 +286,26 @@ export async function handlePublicAnalyticsUptime(c: {
   });
 
   const res = withVisibilityAwareCaching(
-    c.json({
-      generated_at: now,
-      range,
-      range_start_at: rangeStart,
-      range_end_at: rangeEnd,
-      overall: {
-        total_sec,
-        downtime_sec,
-        unknown_sec,
-        uptime_sec,
-        uptime_pct: total_sec === 0 ? 0 : (uptime_sec / total_sec) * 100,
+    new Response(
+      JSON.stringify({
+        generated_at: now,
+        range,
+        range_start_at: rangeStart,
+        range_end_at: rangeEnd,
+        overall: {
+          total_sec,
+          downtime_sec,
+          unknown_sec,
+          uptime_sec,
+          uptime_pct: total_sec === 0 ? 0 : (uptime_sec / total_sec) * 100,
+        },
+        monitors: output,
+      }),
+      {
+        status: 200,
+        headers: { 'Content-Type': 'application/json; charset=utf-8' },
       },
-      monitors: output,
-    }),
+    ),
     includeHiddenMonitors,
   );
   trace.setLabel('path', 'snapshot');
