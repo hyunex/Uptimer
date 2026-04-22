@@ -25,7 +25,8 @@ import {
   type MonitorRuntimeUpdate,
 } from '../public/monitor-runtime';
 import { readSettings } from '../settings';
-import { acquireLease, releaseLease, renewLease } from './lock';
+import { acquireLease, releaseLease } from './lock';
+import { LeaseLostError, startRenewableLease } from './lease-guard';
 import type { NotifyContext } from './notifications';
 
 const LOCK_NAME = 'scheduler:tick';
@@ -38,7 +39,13 @@ const INTERNAL_SCHEDULED_BATCH_CONCURRENCY = 2;
 const HOMEPAGE_REFRESH_SERVICE_TIMEOUT_MS = 15_000;
 const INTERNAL_SCHEDULED_CHECK_BATCH_TIMEOUT_MS = 30_000;
 const BATCH_EXECUTION_LOCK_PREFIX = 'scheduler:batch:';
+const MONITOR_EXECUTION_LOCK_PREFIX = 'scheduler:batch-monitor:';
 const BATCH_EXECUTION_LOCK_LEASE_SECONDS = 15 * 60;
+const MONITOR_EXECUTION_LOCK_LEASE_SECONDS = 75;
+const MONITOR_EXECUTION_LOCK_RENEW_INTERVAL_MS = 25_000;
+const MONITOR_EXECUTION_LOCK_RENEW_MIN_REMAINING_SECONDS = 25;
+const BATCH_EXECUTION_LOCK_RENEW_INTERVAL_MS = 60_000;
+const BATCH_EXECUTION_LOCK_RENEW_MIN_REMAINING_SECONDS = 5 * 60;
 
 const CHECK_CONCURRENCY = 5;
 const D1_MAX_SQL_VARIABLES = 100;
@@ -145,12 +152,15 @@ async function fetchSelfWithTimeout(
   request: Request,
   timeoutMs: number,
   label: string,
+  signal?: AbortSignal,
 ): Promise<Response> {
   if (!env.SELF) {
     throw new Error('SELF service binding missing');
   }
 
   const controller = new AbortController();
+  const abortFromParent = () => controller.abort();
+  signal?.addEventListener('abort', abortFromParent);
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
     return await env.SELF.fetch(new Request(request, { signal: controller.signal }));
@@ -160,6 +170,7 @@ async function fetchSelfWithTimeout(
     }
     throw err;
   } finally {
+    signal?.removeEventListener('abort', abortFromParent);
     clearTimeout(timeout);
   }
 }
@@ -300,6 +311,7 @@ function toScheduledCheckBatchServiceResult(value: unknown): ScheduledCheckBatch
 async function runScheduledCheckBatchViaService(
   env: Env,
   context: ScheduledCheckBatchServiceContext,
+  signal?: AbortSignal,
 ): Promise<ScheduledCheckBatchServiceResult> {
   if (!env.ADMIN_TOKEN) {
     throw new Error('ADMIN_TOKEN missing');
@@ -326,6 +338,7 @@ async function runScheduledCheckBatchViaService(
     }),
     INTERNAL_SCHEDULED_CHECK_BATCH_TIMEOUT_MS,
     'scheduled check batch service',
+    signal,
   );
 
   const bodyText = await res.text().catch(() => '');
@@ -620,6 +633,48 @@ function buildBatchExecutionLockName(checkedAt: number, ids: readonly number[]):
   return `${BATCH_EXECUTION_LOCK_PREFIX}${checkedAt}:${[...ids].sort((a, b) => a - b).join(',')}`;
 }
 
+function buildMonitorExecutionLockName(checkedAt: number, id: number): string {
+  return `${MONITOR_EXECUTION_LOCK_PREFIX}${checkedAt}:${id}`;
+}
+
+type MonitorExecutionLease = {
+  id: number;
+  name: string;
+  guard: ReturnType<typeof startRenewableLease>;
+};
+
+async function claimMonitorExecutionLeases(
+  db: D1Database,
+  checkedAt: number,
+  ids: readonly number[],
+  now: number,
+): Promise<{ claimedIds: number[]; leases: MonitorExecutionLease[] }> {
+  const claimedIds: number[] = [];
+  const leases: MonitorExecutionLease[] = [];
+  const expiresAt = now + MONITOR_EXECUTION_LOCK_LEASE_SECONDS;
+
+  for (const id of ids) {
+    const name = buildMonitorExecutionLockName(checkedAt, id);
+    const acquired = await acquireLease(db, name, now, MONITOR_EXECUTION_LOCK_LEASE_SECONDS);
+    if (!acquired) {
+      continue;
+    }
+    const guard = startRenewableLease({
+      db,
+      name,
+      leaseSeconds: MONITOR_EXECUTION_LOCK_LEASE_SECONDS,
+      initialExpiresAt: expiresAt,
+      renewIntervalMs: MONITOR_EXECUTION_LOCK_RENEW_INTERVAL_MS,
+      renewMinRemainingSeconds: MONITOR_EXECUTION_LOCK_RENEW_MIN_REMAINING_SECONDS,
+      logPrefix: `scheduled batch monitor ${id}`,
+    });
+    claimedIds.push(id);
+    leases.push({ id, name, guard });
+  }
+
+  return { claimedIds, leases };
+}
+
 async function listPendingMonitorRowsByIds(
   db: D1Database,
   ids: readonly number[],
@@ -643,6 +698,7 @@ export async function runExclusivePersistedMonitorBatch(opts: {
   ids: readonly number[];
   checkedAt: number;
   suppressedMonitorIds?: ReadonlySet<number>;
+  abortSignal?: AbortSignal;
   stateMachineConfig: {
     failuresToDownFromUp: number;
     successesToUpFromDown: number;
@@ -662,22 +718,73 @@ export async function runExclusivePersistedMonitorBatch(opts: {
     return createEmptyMonitorBatchExecutionResult();
   }
 
+  const batchLease = startRenewableLease({
+    db: opts.db,
+    name: lockName,
+    leaseSeconds: BATCH_EXECUTION_LOCK_LEASE_SECONDS,
+    initialExpiresAt: expiresAt,
+    renewIntervalMs: BATCH_EXECUTION_LOCK_RENEW_INTERVAL_MS,
+    renewMinRemainingSeconds: BATCH_EXECUTION_LOCK_RENEW_MIN_REMAINING_SECONDS,
+    logPrefix: 'scheduled batch',
+  });
+  let claimedIds: number[] = [];
+  let claimedMonitorLeases: MonitorExecutionLease[] = [];
+
   try {
-    const rows = await listPendingMonitorRowsByIds(opts.db, ids, opts.checkedAt);
+    const claimed = await claimMonitorExecutionLeases(opts.db, opts.checkedAt, ids, now);
+    claimedIds = claimed.claimedIds;
+    claimedMonitorLeases = claimed.leases;
+    const skippedLockCount = Math.max(0, ids.length - claimedIds.length);
+    const rows = await listPendingMonitorRowsByIds(opts.db, claimedIds, opts.checkedAt);
     if (rows.length === 0) {
-      return createEmptyMonitorBatchExecutionResult();
+      return {
+        ...createEmptyMonitorBatchExecutionResult(),
+        stats: {
+          ...createEmptyMonitorBatchExecutionResult().stats,
+          rejectedCount: skippedLockCount,
+        },
+      };
     }
 
-    return await runPersistedMonitorBatch({
+    const result = await runPersistedMonitorBatch({
       db: opts.db,
       rows,
       checkedAt: opts.checkedAt,
       stateMachineConfig: opts.stateMachineConfig,
       ...(opts.suppressedMonitorIds ? { suppressedMonitorIds: opts.suppressedMonitorIds } : {}),
       ...(opts.onPersistedMonitor ? { onPersistedMonitor: opts.onPersistedMonitor } : {}),
+      beforePersist: () => {
+        if (opts.abortSignal?.aborted) {
+          throw new LeaseLostError(`scheduled batch: ${lockName} aborted by caller`);
+        }
+        batchLease.assertHeld(`persisting ${lockName}`);
+        for (const lease of claimedMonitorLeases) {
+          lease.guard.assertHeld(`persisting ${lease.name}`);
+        }
+      },
     });
+    result.stats.rejectedCount += skippedLockCount;
+    return result;
+  } catch (err) {
+    if (err instanceof LeaseLostError) {
+      throw err;
+    }
+    throw err;
   } finally {
-    await releaseLease(opts.db, lockName, expiresAt).catch((err) => {
+    await Promise.all(
+      claimedMonitorLeases.map(async (lease) => {
+        await lease.guard.stop().catch((err) => {
+          console.warn('scheduled batch monitor: lease renewal task failed', err);
+        });
+        await releaseLease(opts.db, lease.name, lease.guard.getExpiresAt()).catch((err) => {
+          console.warn('scheduled: failed to release monitor execution lease', err);
+        });
+      }),
+    );
+    await batchLease.stop().catch((err) => {
+      console.warn('scheduled batch: lease renewal task failed', err);
+    });
+    await releaseLease(opts.db, lockName, batchLease.getExpiresAt()).catch((err) => {
       console.warn('scheduled: failed to release batch execution lease', err);
     });
   }
@@ -1052,6 +1159,7 @@ export async function runPersistedMonitorBatch(opts: {
     successesToUpFromDown: number;
   };
   onPersistedMonitor?: (completed: CompletedDueMonitor) => void;
+  beforePersist?: () => void | Promise<void>;
 }): Promise<MonitorBatchExecutionResult> {
   const limit = pLimit(CHECK_CONCURRENCY);
   const suppressedMonitorIds = opts.suppressedMonitorIds ?? new Set<number>();
@@ -1080,6 +1188,7 @@ export async function runPersistedMonitorBatch(opts: {
 
   let persistDurMs = 0;
   if (completed.length > 0) {
+    await opts.beforePersist?.();
     const persistStart = performance.now();
     await persistCompletedMonitors(opts.db, completed);
     persistDurMs = performance.now() - persistStart;
@@ -1129,20 +1238,30 @@ function chunkDueMonitorRows(rows: DueMonitorRow[], size: number): DueMonitorRow
 export async function runScheduledTick(env: Env, ctx: ExecutionContext): Promise<void> {
   const now = Math.floor(Date.now() / 1000);
   const checkedAt = Math.floor(now / 60) * 60;
-  let claimedLeaseExpiresAt = now + LOCK_LEASE_SECONDS;
+  const claimedLeaseExpiresAt = now + LOCK_LEASE_SECONDS;
   const totalStart = performance.now();
+  const currentNow = () => Math.floor(Date.now() / 1000);
   const queueHomepageRefresh = (runtimeUpdates?: MonitorRuntimeUpdate[]) =>
     env.SELF
       ? refreshHomepageSnapshotViaService(
           env,
           runtimeUpdates ? { runtimeUpdates } : undefined,
-        ).catch(async (err) => {
-          console.warn('homepage snapshot: service refresh failed', err);
-          await refreshHomepageSnapshotInline(env, now).catch((fallbackErr) => {
-            console.warn('homepage snapshot: refresh failed', fallbackErr);
-          });
-        })
-      : refreshHomepageSnapshotInline(env, now).catch((err) => {
+        )
+          .then(async (result) => {
+            if (!runtimeUpdates?.length || result.refreshed !== false) {
+              return;
+            }
+            await refreshHomepageSnapshotInline(env, currentNow()).catch((fallbackErr) => {
+              console.warn('homepage snapshot: refresh failed', fallbackErr);
+            });
+          })
+          .catch(async (err) => {
+            console.warn('homepage snapshot: service refresh failed', err);
+            await refreshHomepageSnapshotInline(env, currentNow()).catch((fallbackErr) => {
+              console.warn('homepage snapshot: refresh failed', fallbackErr);
+            });
+          })
+      : refreshHomepageSnapshotInline(env, currentNow()).catch((err) => {
           console.warn('homepage snapshot: refresh failed', err);
         });
 
@@ -1150,40 +1269,15 @@ export async function runScheduledTick(env: Env, ctx: ExecutionContext): Promise
   if (!acquired) {
     return;
   }
-
-  let stopLeaseRenewal = false;
-  let leaseRenewalTask = Promise.resolve();
-  const leaseRenewalTimer = setInterval(() => {
-    leaseRenewalTask = leaseRenewalTask
-      .then(async () => {
-        if (stopLeaseRenewal) {
-          return;
-        }
-
-        const renewalNow = Math.floor(Date.now() / 1000);
-        if (claimedLeaseExpiresAt - renewalNow > LOCK_RENEW_MIN_REMAINING_SECONDS) {
-          return;
-        }
-
-        const nextExpiresAt = renewalNow + LOCK_LEASE_SECONDS;
-        const renewed = await renewLease(
-          env.DB,
-          LOCK_NAME,
-          claimedLeaseExpiresAt,
-          nextExpiresAt,
-        );
-        if (!renewed) {
-          stopLeaseRenewal = true;
-          console.warn('scheduled: lease renewal lost');
-          return;
-        }
-
-        claimedLeaseExpiresAt = nextExpiresAt;
-      })
-      .catch((err) => {
-        console.warn('scheduled: failed to renew lease', err);
-      });
-  }, LOCK_RENEW_INTERVAL_MS);
+  const schedulerLease = startRenewableLease({
+    db: env.DB,
+    name: LOCK_NAME,
+    leaseSeconds: LOCK_LEASE_SECONDS,
+    initialExpiresAt: claimedLeaseExpiresAt,
+    renewIntervalMs: LOCK_RENEW_INTERVAL_MS,
+    renewMinRemainingSeconds: LOCK_RENEW_MIN_REMAINING_SECONDS,
+    logPrefix: 'scheduled',
+  });
 
   try {
     const [settings, due, hasWebhookNotifications] = await Promise.all([
@@ -1209,6 +1303,7 @@ export async function runScheduledTick(env: Env, ctx: ExecutionContext): Promise
     };
 
     if (due.length === 0) {
+      schedulerLease.assertHeld('queueing homepage refresh');
       ctx.waitUntil(queueHomepageRefresh());
       return;
     }
@@ -1255,6 +1350,7 @@ export async function runScheduledTick(env: Env, ctx: ExecutionContext): Promise
       const batchResults = await Promise.all(
         serviceBatchRows.map((rows) =>
           batchLimit(async () => {
+            schedulerLease.assertHeld('dispatching scheduled service batch');
             const ids = rows.map((row) => row.id);
             const suppressedIds = ids.filter((id) => suppressedMonitorIds.has(id));
             try {
@@ -1264,13 +1360,15 @@ export async function runScheduledTick(env: Env, ctx: ExecutionContext): Promise
                 suppressedMonitorIds: suppressedIds,
                 stateMachineConfig,
                 allowNotifications: Boolean(notify),
-              });
+              }, schedulerLease.signal);
             } catch (err) {
+              schedulerLease.assertHeld('dispatching inline fallback for service batch');
               console.warn('scheduled: service batch failed, falling back inline', err);
               const fallbackBatch = await runExclusivePersistedMonitorBatch({
                 db: env.DB,
                 ids,
                 checkedAt,
+                abortSignal: schedulerLease.signal,
                 suppressedMonitorIds: new Set(suppressedIds),
                 stateMachineConfig,
                 ...(inlineNotificationHandler
@@ -1302,6 +1400,9 @@ export async function runScheduledTick(env: Env, ctx: ExecutionContext): Promise
         suppressedMonitorIds,
         stateMachineConfig,
         ...(inlineNotificationHandler ? { onPersistedMonitor: inlineNotificationHandler } : {}),
+        beforePersist: () => {
+          schedulerLease.assertHeld('persisting inline scheduled batch');
+        },
       });
       batchWallDurMs = batch.checksDurMs + batch.persistDurMs;
       runtimeUpdates = batch.runtimeUpdates;
@@ -1310,18 +1411,20 @@ export async function runScheduledTick(env: Env, ctx: ExecutionContext): Promise
       mergeBatchStats(aggregateStats, batch.stats);
     }
 
+    const runtimeSnapshotNow = currentNow();
+
     if (requiresRuntimeSnapshotRebuild) {
       const runtimeSnapshotStart = performance.now();
-      const rebuiltSnapshot = await rebuildPublicMonitorRuntimeSnapshot(env.DB, now);
-      await writePublicMonitorRuntimeSnapshot(env.DB, rebuiltSnapshot, now);
+      const rebuiltSnapshot = await rebuildPublicMonitorRuntimeSnapshot(env.DB, runtimeSnapshotNow);
+      await writePublicMonitorRuntimeSnapshot(env.DB, rebuiltSnapshot, runtimeSnapshotNow);
       runtimeSnapshotDurMs = performance.now() - runtimeSnapshotStart;
     } else if (runtimeUpdates.length > 0) {
       const runtimeSnapshotStart = performance.now();
       await refreshPublicMonitorRuntimeSnapshot({
         db: env.DB,
-        now,
+        now: runtimeSnapshotNow,
         updates: runtimeUpdates,
-        rebuild: async () => await rebuildPublicMonitorRuntimeSnapshot(env.DB, now),
+        rebuild: async () => await rebuildPublicMonitorRuntimeSnapshot(env.DB, runtimeSnapshotNow),
       });
       runtimeSnapshotDurMs = performance.now() - runtimeSnapshotStart;
     }
@@ -1340,13 +1443,17 @@ export async function runScheduledTick(env: Env, ctx: ExecutionContext): Promise
     }
 
     ctx.waitUntil(queueHomepageRefresh(requiresFullHomepageRefresh ? undefined : runtimeUpdates));
+  } catch (err) {
+    if (err instanceof LeaseLostError) {
+      console.warn(err.message);
+      return;
+    }
+    throw err;
   } finally {
-    stopLeaseRenewal = true;
-    clearInterval(leaseRenewalTimer);
-    await leaseRenewalTask.catch((err) => {
+    await schedulerLease.stop().catch((err) => {
       console.warn('scheduled: lease renewal task failed', err);
     });
-    await releaseLease(env.DB, LOCK_NAME, claimedLeaseExpiresAt).catch((err) => {
+    await releaseLease(env.DB, LOCK_NAME, schedulerLease.getExpiresAt()).catch((err) => {
       console.warn('scheduled: failed to release lease', err);
     });
   }

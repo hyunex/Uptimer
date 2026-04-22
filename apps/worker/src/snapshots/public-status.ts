@@ -4,6 +4,7 @@ import { primeStatusSnapshotCache } from './public-status-read';
 
 const SNAPSHOT_KEY = 'status';
 const MAX_AGE_SECONDS = 60;
+const FUTURE_SNAPSHOT_TOLERANCE_SECONDS = 60;
 const READ_STATUS_SQL = `
   SELECT generated_at, body_json
   FROM public_snapshots
@@ -17,6 +18,7 @@ const UPSERT_STATUS_SQL = `
     body_json = excluded.body_json,
     updated_at = excluded.updated_at
   WHERE excluded.generated_at >= public_snapshots.generated_at
+    OR public_snapshots.generated_at > ?5
 `;
 
 const readStatusStatementByDb = new WeakMap<D1Database, D1PreparedStatement>();
@@ -71,6 +73,7 @@ export async function readStatusSnapshot(
       .first<{ generated_at: number; body_json: string }>();
 
     if (!row) return null;
+    if (row.generated_at > now + FUTURE_SNAPSHOT_TOLERANCE_SECONDS) return null;
 
     const age = Math.max(0, now - row.generated_at);
     if (age > MAX_AGE_SECONDS) return null;
@@ -110,6 +113,7 @@ export async function readStatusSnapshotJson(
       .first<{ generated_at: number; body_json: string }>();
 
     if (!row) return null;
+    if (row.generated_at > now + FUTURE_SNAPSHOT_TOLERANCE_SECONDS) return null;
 
     const age = Math.max(0, now - row.generated_at);
     if (age > MAX_AGE_SECONDS) return null;
@@ -145,7 +149,15 @@ export async function writeStatusSnapshot(
     bodyJson,
     data: payload,
   });
-  await statement.bind(SNAPSHOT_KEY, payload.generated_at, bodyJson, now).run();
+  await statement
+    .bind(
+      SNAPSHOT_KEY,
+      payload.generated_at,
+      bodyJson,
+      now,
+      now + FUTURE_SNAPSHOT_TOLERANCE_SECONDS,
+    )
+    .run();
 }
 
 export function applyStatusCacheHeaders(res: Response, ageSeconds: number): void {

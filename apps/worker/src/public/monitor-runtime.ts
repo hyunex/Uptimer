@@ -5,6 +5,7 @@ export const MONITOR_RUNTIME_TOTALS_SNAPSHOT_KEY = 'monitor-runtime:totals';
 export const MONITOR_RUNTIME_SNAPSHOT_VERSION = 1;
 export const MONITOR_RUNTIME_MAX_AGE_SECONDS = 3 * 60;
 export const MONITOR_RUNTIME_HEARTBEAT_POINTS = 60;
+const FUTURE_SNAPSHOT_TOLERANCE_SECONDS = 60;
 
 const READ_RUNTIME_SNAPSHOT_SQL = `
   SELECT generated_at, updated_at, body_json
@@ -21,6 +22,7 @@ const UPSERT_RUNTIME_SNAPSHOT_ROWS_SQL = `
     body_json = excluded.body_json,
     updated_at = excluded.updated_at
   WHERE excluded.generated_at >= public_snapshots.generated_at
+    OR public_snapshots.generated_at > ?9
 `;
 
 export type MonitorRuntimeStatusCode = 'u' | 'd' | 'm' | 'p' | 'x';
@@ -524,12 +526,14 @@ type RuntimeSnapshotRow = {
 type RuntimeSnapshotCacheEntry = {
   generatedAt: number;
   updatedAt: number;
+  rawBodyJson: string;
   snapshot: PublicMonitorRuntimeSnapshot;
 };
 
 type RuntimeTotalsSnapshotCacheEntry = {
   generatedAt: number;
   updatedAt: number;
+  rawBodyJson: string;
   snapshot: PublicMonitorRuntimeTotalsSnapshot;
 };
 
@@ -622,6 +626,7 @@ function upsertRuntimeSnapshotRowsStatement(
     totalsSnapshot.generated_at,
     JSON.stringify(totalsSnapshot),
     now,
+    now + FUTURE_SNAPSHOT_TOLERANCE_SECONDS,
   );
 }
 
@@ -635,13 +640,16 @@ function readCachedRuntimeSnapshot(
   db: D1Database,
   generatedAt: number,
   updatedAt: number,
+  rawBodyJson: string,
 ): PublicMonitorRuntimeSnapshot | null {
   const cached = runtimeSnapshotCacheByDb.get(db);
   if (!cached) {
     return null;
   }
 
-  return cached.generatedAt === generatedAt && cached.updatedAt === updatedAt
+  return cached.generatedAt === generatedAt &&
+    cached.updatedAt === updatedAt &&
+    cached.rawBodyJson === rawBodyJson
     ? cached.snapshot
     : null;
 }
@@ -650,11 +658,13 @@ function writeCachedRuntimeSnapshot(
   db: D1Database,
   generatedAt: number,
   updatedAt: number,
+  rawBodyJson: string,
   snapshot: PublicMonitorRuntimeSnapshot,
 ): PublicMonitorRuntimeSnapshot {
   runtimeSnapshotCacheByDb.set(db, {
     generatedAt,
     updatedAt,
+    rawBodyJson,
     snapshot,
   });
   return snapshot;
@@ -664,13 +674,16 @@ function readCachedRuntimeTotalsSnapshot(
   db: D1Database,
   generatedAt: number,
   updatedAt: number,
+  rawBodyJson: string,
 ): PublicMonitorRuntimeTotalsSnapshot | null {
   const cached = runtimeTotalsSnapshotCacheByDb.get(db);
   if (!cached) {
     return null;
   }
 
-  return cached.generatedAt === generatedAt && cached.updatedAt === updatedAt
+  return cached.generatedAt === generatedAt &&
+    cached.updatedAt === updatedAt &&
+    cached.rawBodyJson === rawBodyJson
     ? cached.snapshot
     : null;
 }
@@ -679,11 +692,13 @@ function writeCachedRuntimeTotalsSnapshot(
   db: D1Database,
   generatedAt: number,
   updatedAt: number,
+  rawBodyJson: string,
   snapshot: PublicMonitorRuntimeTotalsSnapshot,
 ): PublicMonitorRuntimeTotalsSnapshot {
   runtimeTotalsSnapshotCacheByDb.set(db, {
     generatedAt,
     updatedAt,
+    rawBodyJson,
     snapshot,
   });
   return snapshot;
@@ -827,7 +842,7 @@ async function readStoredMonitorRuntimeSnapshot(
     if (!row?.body_json) return null;
 
     const updatedAt = toSnapshotUpdatedAt(row);
-    const cachedSnapshot = readCachedRuntimeSnapshot(db, row.generated_at, updatedAt);
+    const cachedSnapshot = readCachedRuntimeSnapshot(db, row.generated_at, updatedAt, row.body_json);
     if (cachedSnapshot) {
       return {
         generatedAt: row.generated_at,
@@ -843,7 +858,13 @@ async function readStoredMonitorRuntimeSnapshot(
     if (globalCachedSnapshot) {
       return {
         generatedAt: row.generated_at,
-        snapshot: writeCachedRuntimeSnapshot(db, row.generated_at, updatedAt, globalCachedSnapshot),
+        snapshot: writeCachedRuntimeSnapshot(
+          db,
+          row.generated_at,
+          updatedAt,
+          row.body_json,
+          globalCachedSnapshot,
+        ),
       };
     }
 
@@ -860,6 +881,7 @@ async function readStoredMonitorRuntimeSnapshot(
         db,
         row.generated_at,
         updatedAt,
+        row.body_json,
         writeCachedRuntimeSnapshotGlobal(row.generated_at, updatedAt, row.body_json, parsed.data),
       ),
     };
@@ -884,7 +906,12 @@ async function readStoredMonitorRuntimeTotalsSnapshot(
     }
 
     const updatedAt = toSnapshotUpdatedAt(row);
-    const cachedSnapshot = readCachedRuntimeTotalsSnapshot(db, row.generated_at, updatedAt);
+    const cachedSnapshot = readCachedRuntimeTotalsSnapshot(
+      db,
+      row.generated_at,
+      updatedAt,
+      row.body_json,
+    );
     if (cachedSnapshot) {
       return {
         generatedAt: row.generated_at,
@@ -904,6 +931,7 @@ async function readStoredMonitorRuntimeTotalsSnapshot(
           db,
           row.generated_at,
           updatedAt,
+          row.body_json,
           globalCachedSnapshot,
         ),
       };
@@ -922,6 +950,7 @@ async function readStoredMonitorRuntimeTotalsSnapshot(
         db,
         row.generated_at,
         updatedAt,
+        row.body_json,
         writeCachedRuntimeTotalsSnapshotGlobal(
           row.generated_at,
           updatedAt,
@@ -949,7 +978,12 @@ async function readStoredMonitorRuntimeTotalsSnapshotFromFullSnapshot(
     if (!row?.body_json) return null;
 
     const updatedAt = toSnapshotUpdatedAt(row);
-    const cachedSnapshot = readCachedRuntimeTotalsSnapshot(db, row.generated_at, updatedAt);
+    const cachedSnapshot = readCachedRuntimeTotalsSnapshot(
+      db,
+      row.generated_at,
+      updatedAt,
+      row.body_json,
+    );
     if (cachedSnapshot) {
       return {
         generatedAt: row.generated_at,
@@ -969,6 +1003,7 @@ async function readStoredMonitorRuntimeTotalsSnapshotFromFullSnapshot(
           db,
           row.generated_at,
           updatedAt,
+          row.body_json,
           globalCachedSnapshot,
         ),
       };
@@ -987,6 +1022,7 @@ async function readStoredMonitorRuntimeTotalsSnapshotFromFullSnapshot(
         db,
         row.generated_at,
         updatedAt,
+        row.body_json,
         writeCachedRuntimeTotalsSnapshotGlobal(
           row.generated_at,
           updatedAt,
@@ -1011,6 +1047,9 @@ export async function readPublicMonitorRuntimeSnapshot(
 ): Promise<PublicMonitorRuntimeSnapshot | null> {
   const stored = await readStoredMonitorRuntimeSnapshot(db);
   if (!stored) return null;
+  if (stored.generatedAt > now + FUTURE_SNAPSHOT_TOLERANCE_SECONDS) {
+    return null;
+  }
 
   const age = Math.max(0, now - stored.generatedAt);
   if (age > maxAgeSeconds) {
@@ -1032,6 +1071,9 @@ export async function readPublicMonitorRuntimeTotalsSnapshot(
 ): Promise<PublicMonitorRuntimeTotalsSnapshot | null> {
   const stored = await readStoredMonitorRuntimeTotalsSnapshot(db);
   if (!stored) return null;
+  if (stored.generatedAt > now + FUTURE_SNAPSHOT_TOLERANCE_SECONDS) {
+    return null;
+  }
 
   const age = Math.max(0, now - stored.generatedAt);
   if (age > maxAgeSeconds) {
@@ -1085,16 +1127,23 @@ export async function writePublicMonitorRuntimeSnapshot(
   } satisfies PublicMonitorRuntimeTotalsSnapshot;
   const bodyJson = JSON.stringify(snapshot);
   const totalsBodyJson = JSON.stringify(totalsSnapshot);
-  writeCachedRuntimeSnapshot(db, snapshot.generated_at, now, snapshot);
-  writeCachedRuntimeSnapshotGlobal(snapshot.generated_at, now, bodyJson, snapshot);
-  writeCachedRuntimeTotalsSnapshot(db, totalsSnapshot.generated_at, now, totalsSnapshot);
-  writeCachedRuntimeTotalsSnapshotGlobal(
+  const writeNow = Math.max(now, Math.floor(Date.now() / 1000));
+  writeCachedRuntimeSnapshot(db, snapshot.generated_at, writeNow, bodyJson, snapshot);
+  writeCachedRuntimeSnapshotGlobal(snapshot.generated_at, writeNow, bodyJson, snapshot);
+  writeCachedRuntimeTotalsSnapshot(
+    db,
     totalsSnapshot.generated_at,
-    now,
+    writeNow,
     totalsBodyJson,
     totalsSnapshot,
   );
-  await upsertRuntimeSnapshotRowsStatement(db, snapshot, totalsSnapshot, now).run();
+  writeCachedRuntimeTotalsSnapshotGlobal(
+    totalsSnapshot.generated_at,
+    writeNow,
+    totalsBodyJson,
+    totalsSnapshot,
+  );
+  await upsertRuntimeSnapshotRowsStatement(db, snapshot, totalsSnapshot, writeNow).run();
 }
 
 export function snapshotHasMonitorIds(
@@ -1417,6 +1466,7 @@ export async function refreshPublicMonitorRuntimeSnapshot(opts: {
   now: number;
   updates: MonitorRuntimeUpdate[];
   rebuild: () => Promise<PublicMonitorRuntimeSnapshot>;
+  beforeWrite?: () => void | Promise<void>;
 }): Promise<PublicMonitorRuntimeSnapshot> {
   const stored = await readStoredMonitorRuntimeSnapshot(opts.db);
   const dayStart = utcDayStart(opts.now);
@@ -1428,6 +1478,7 @@ export async function refreshPublicMonitorRuntimeSnapshot(opts: {
 
   if (shouldRebuild) {
     const rebuilt = await opts.rebuild();
+    await opts.beforeWrite?.();
     await writePublicMonitorRuntimeSnapshot(opts.db, rebuilt, opts.now);
     return rebuilt;
   }
@@ -1438,15 +1489,17 @@ export async function refreshPublicMonitorRuntimeSnapshot(opts: {
     (update) =>
       !snapshotMonitorIds.has(update.monitor_id) &&
       update.created_at < dayStart &&
-      update.checked_at > dayStart + update.interval_sec,
+      update.checked_at >= dayStart + update.interval_sec,
   );
   if (missingHistoricalEntry) {
     const rebuilt = await opts.rebuild();
+    await opts.beforeWrite?.();
     await writePublicMonitorRuntimeSnapshot(opts.db, rebuilt, opts.now);
     return rebuilt;
   }
 
   const next = applyMonitorRuntimeUpdates(snapshot, opts.now, opts.updates);
+  await opts.beforeWrite?.();
   await writePublicMonitorRuntimeSnapshot(opts.db, next, opts.now);
   return next;
 }

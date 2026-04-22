@@ -297,6 +297,231 @@ describe('public incident feed regression', () => {
       next_cursor: null,
     });
   });
+
+  it('paginates resolved incidents by resolved_at while keeping cursor ids stable', async () => {
+    const handlers: FakeD1QueryHandler[] = [
+      {
+        match: (sql) =>
+          sql.includes("from incidents") &&
+          sql.includes("where status = 'resolved'") &&
+          sql.includes('order by resolved_at desc, id desc'),
+        all: (args) => {
+          if (args.length === 1) {
+            return [
+              {
+                id: 5,
+                title: 'Newest resolved',
+                status: 'resolved',
+                impact: 'minor',
+                message: null,
+                started_at: 100,
+                resolved_at: 500,
+              },
+              {
+                id: 7,
+                title: 'Second resolved',
+                status: 'resolved',
+                impact: 'minor',
+                message: null,
+                started_at: 90,
+                resolved_at: 400,
+              },
+              {
+                id: 9,
+                title: 'Oldest resolved',
+                status: 'resolved',
+                impact: 'minor',
+                message: null,
+                started_at: 80,
+                resolved_at: 300,
+              },
+            ];
+          }
+
+          expect(args).toEqual([50, 500, 5]);
+          return [
+            {
+              id: 7,
+              title: 'Second resolved',
+              status: 'resolved',
+              impact: 'minor',
+              message: null,
+              started_at: 90,
+              resolved_at: 400,
+            },
+            {
+              id: 9,
+              title: 'Oldest resolved',
+              status: 'resolved',
+              impact: 'minor',
+              message: null,
+              started_at: 80,
+              resolved_at: 300,
+            },
+          ];
+        },
+      },
+      {
+        match: (sql) =>
+          sql.includes('select id, resolved_at') &&
+          sql.includes("from incidents") &&
+          sql.includes("status = 'resolved'"),
+        first: () => ({
+          id: 5,
+          resolved_at: 500,
+        }),
+      },
+      {
+        match: 'from incident_updates',
+        all: () => [],
+      },
+      {
+        match: 'from incident_monitors',
+        all: () => [],
+      },
+    ];
+
+    const firstPage = await requestPublic('/incidents?resolved_only=1&limit=1', handlers);
+    expect(firstPage.res.status).toBe(200);
+    expect(firstPage.body).toMatchObject({
+      incidents: [{ id: 5 }],
+      next_cursor: 5,
+    });
+
+    const secondPage = await requestPublic('/incidents?resolved_only=1&limit=1&cursor=5', handlers);
+    expect(secondPage.res.status).toBe(200);
+    expect(secondPage.body).toMatchObject({
+      incidents: [{ id: 7 }],
+      next_cursor: 7,
+    });
+  });
+
+  it('paginates maintenance history by ends_at while keeping cursor ids stable', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(1_728_600_000_000);
+
+    const handlers: FakeD1QueryHandler[] = [
+      {
+        match: (sql) =>
+          sql.includes('from maintenance_windows') &&
+          sql.includes('where ends_at <= ?1') &&
+          sql.includes('order by ends_at desc, id desc'),
+        all: (args) => {
+          if (args.length === 2) {
+            return [
+              {
+                id: 4,
+                title: 'Newest maintenance',
+                message: null,
+                starts_at: 100,
+                ends_at: 450,
+                created_at: 90,
+              },
+              {
+                id: 8,
+                title: 'Older maintenance',
+                message: null,
+                starts_at: 50,
+                ends_at: 250,
+                created_at: 40,
+              },
+            ];
+          }
+
+          expect(args).toEqual([1_728_600_000, 50, 450, 4]);
+          return [
+            {
+              id: 8,
+              title: 'Older maintenance',
+              message: null,
+              starts_at: 50,
+              ends_at: 250,
+              created_at: 40,
+            },
+          ];
+        },
+      },
+      {
+        match: (sql) =>
+          sql.includes('select id, ends_at') && sql.includes('from maintenance_windows'),
+        first: () => ({
+          id: 4,
+          ends_at: 450,
+        }),
+      },
+      {
+        match: 'from maintenance_window_monitors',
+        all: () => [],
+      },
+    ];
+
+    const firstPage = await requestPublic('/maintenance-windows?limit=1', handlers);
+    expect(firstPage.res.status).toBe(200);
+    expect(firstPage.body).toMatchObject({
+      maintenance_windows: [{ id: 4 }],
+      next_cursor: 4,
+    });
+
+    const secondPage = await requestPublic('/maintenance-windows?limit=1&cursor=4', handlers);
+    expect(secondPage.res.status).toBe(200);
+    expect(secondPage.body).toMatchObject({
+      maintenance_windows: [{ id: 8 }],
+      next_cursor: null,
+    });
+  });
+
+  it('applies incident visibility rules to resolved cursor lookups for anonymous requests', async () => {
+    const handlers: FakeD1QueryHandler[] = [
+      {
+        match: (sql) =>
+          sql.includes('select id, resolved_at') &&
+          sql.includes("status = 'resolved'") &&
+          sql.includes('show_on_status_page = 1'),
+        first: () => null,
+      },
+      {
+        match: 'from incident_updates',
+        all: () => [],
+      },
+      {
+        match: 'from incident_monitors',
+        all: () => [],
+      },
+    ];
+
+    const page = await requestPublic('/incidents?resolved_only=1&limit=1&cursor=999', handlers);
+
+    expect(page.res.status).toBe(200);
+    expect(page.body).toMatchObject({
+      incidents: [],
+      next_cursor: null,
+    });
+  });
+
+  it('applies maintenance visibility rules to history cursor lookups for anonymous requests', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(1_728_600_000_000);
+
+    const handlers: FakeD1QueryHandler[] = [
+      {
+        match: (sql) =>
+          sql.includes('select id, ends_at') &&
+          sql.includes('from maintenance_windows') &&
+          sql.includes('show_on_status_page = 1'),
+        first: () => null,
+      },
+      {
+        match: 'from maintenance_window_monitors',
+        all: () => [],
+      },
+    ];
+
+    const page = await requestPublic('/maintenance-windows?limit=1&cursor=999', handlers);
+
+    expect(page.res.status).toBe(200);
+    expect(page.body).toMatchObject({
+      maintenance_windows: [],
+      next_cursor: null,
+    });
+  });
 });
 
 describe('public route cache/auth regression', () => {

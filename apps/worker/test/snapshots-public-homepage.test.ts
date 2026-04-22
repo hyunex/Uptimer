@@ -2,9 +2,11 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../src/scheduler/lock', () => ({
   acquireLease: vi.fn(),
+  releaseLease: vi.fn(),
+  renewLease: vi.fn(),
 }));
 
-import { acquireLease } from '../src/scheduler/lock';
+import { acquireLease, releaseLease, renewLease } from '../src/scheduler/lock';
 import {
   applyHomepageCacheHeaders,
   buildHomepageRenderArtifact,
@@ -260,6 +262,7 @@ describe('snapshots/public-homepage', () => {
         280,
         JSON.stringify(storedRender),
         300,
+        360,
       ],
     ]);
   });
@@ -301,6 +304,94 @@ describe('snapshots/public-homepage', () => {
     );
   });
 
+  it('self-heals future-dated homepage snapshot rows with a newer real-time refresh', async () => {
+    const rows = new Map<string, { generated_at: number; body_json: string; updated_at: number }>();
+    const db = createFakeD1Database([
+      {
+        match: 'insert into public_snapshots',
+        run: (args) => {
+          const futureCutoffAt = Number(args[8] ?? 0);
+          const pairs = [
+            args.slice(0, 4),
+            args.slice(4, 8),
+          ] as [string, number, string, number][];
+          for (const [key, generatedAt, bodyJson, updatedAt] of pairs) {
+            const existing = rows.get(key);
+            if (
+              !existing ||
+              generatedAt >= existing.generated_at ||
+              existing.generated_at > futureCutoffAt
+            ) {
+              rows.set(key, {
+                generated_at: generatedAt,
+                body_json: bodyJson,
+                updated_at: updatedAt,
+              });
+            }
+          }
+          return { meta: { changes: 1 } };
+        },
+      },
+    ]);
+
+    const futurePayload = samplePayload(900);
+    const currentPayload = samplePayload(300);
+
+    await writeHomepageSnapshot(db, 900, futurePayload);
+    await writeHomepageSnapshot(db, 320, currentPayload);
+
+    expect(rows.get('homepage')?.generated_at).toBe(300);
+    expect(rows.get('homepage')?.body_json).toBe(JSON.stringify(currentPayload));
+    expect(rows.get('homepage:artifact')?.generated_at).toBe(300);
+    expect(rows.get('homepage:artifact')?.body_json).toBe(
+      JSON.stringify(buildHomepageRenderArtifact(currentPayload)),
+    );
+  });
+
+  it('does not let a late older homepage snapshot roll back a legitimate newer row', async () => {
+    const rows = new Map<string, { generated_at: number; body_json: string; updated_at: number }>();
+    const db = createFakeD1Database([
+      {
+        match: 'insert into public_snapshots',
+        run: (args) => {
+          const futureCutoffAt = Number(args[8] ?? 0);
+          const pairs = [
+            args.slice(0, 4),
+            args.slice(4, 8),
+          ] as [string, number, string, number][];
+          for (const [key, generatedAt, bodyJson, updatedAt] of pairs) {
+            const existing = rows.get(key);
+            if (
+              !existing ||
+              generatedAt >= existing.generated_at ||
+              existing.generated_at > futureCutoffAt
+            ) {
+              rows.set(key, {
+                generated_at: generatedAt,
+                body_json: bodyJson,
+                updated_at: updatedAt,
+              });
+            }
+          }
+          return { meta: { changes: 1 } };
+        },
+      },
+    ]);
+
+    const newerPayload = samplePayload(421);
+    const olderPayload = samplePayload(360);
+
+    await writeHomepageSnapshot(db, 430, newerPayload);
+    await writeHomepageSnapshot(db, 435, olderPayload);
+
+    expect(rows.get('homepage')?.generated_at).toBe(421);
+    expect(rows.get('homepage')?.body_json).toBe(JSON.stringify(newerPayload));
+    expect(rows.get('homepage:artifact')?.generated_at).toBe(421);
+    expect(rows.get('homepage:artifact')?.body_json).toBe(
+      JSON.stringify(buildHomepageRenderArtifact(newerPayload)),
+    );
+  });
+
   it('continues writing the compact homepage payload row when requested', async () => {
     const boundArgs: unknown[][] = [];
     const db = createFakeD1Database([
@@ -326,6 +417,7 @@ describe('snapshots/public-homepage', () => {
         280,
         JSON.stringify(buildHomepageRenderArtifact(payload)),
         300,
+        360,
       ],
     ]);
   });
@@ -356,7 +448,7 @@ describe('snapshots/public-homepage', () => {
     await writeHomepageArtifactSnapshot(db, 300, payload);
 
     expect(boundArgs).toEqual([
-      ['homepage:artifact', 280, JSON.stringify(buildHomepageRenderArtifact(payload)), 300],
+      ['homepage:artifact', 280, JSON.stringify(buildHomepageRenderArtifact(payload)), 300, 360],
     ]);
   });
 
@@ -406,6 +498,7 @@ describe('snapshots/public-homepage', () => {
     let readCount = 0;
     const writtenArgs: unknown[][] = [];
     const now = 1_728_000_120;
+    vi.spyOn(Date, 'now').mockReturnValue(now * 1000);
     const db = createFakeD1Database([
       {
         match: 'from public_snapshots',
@@ -441,6 +534,7 @@ describe('snapshots/public-homepage', () => {
 
     expect(refreshed).toBe(true);
     expect(acquireLease).toHaveBeenCalledWith(db, 'snapshot:homepage:refresh', now, 55);
+    expect(releaseLease).toHaveBeenCalledWith(db, 'snapshot:homepage:refresh', now + 55);
     expect(compute).toHaveBeenCalledTimes(1);
     expect(writtenArgs).toEqual([
       [
@@ -452,6 +546,7 @@ describe('snapshots/public-homepage', () => {
         now,
         JSON.stringify(storedRender),
         now,
+        now + 60,
       ],
     ]);
   });
@@ -461,6 +556,7 @@ describe('snapshots/public-homepage', () => {
 
     const writtenArgs: unknown[][] = [];
     const now = 1_728_000_045;
+    vi.spyOn(Date, 'now').mockReturnValue(now * 1000);
     const payload = samplePayload(now);
     const db = createFakeD1Database([
       {
@@ -490,6 +586,7 @@ describe('snapshots/public-homepage', () => {
 
     expect(refreshed).toBe(true);
     expect(compute).toHaveBeenCalledTimes(1);
+    expect(releaseLease).toHaveBeenCalledWith(db, 'snapshot:homepage:refresh', now + 55);
     expect(writtenArgs).toEqual([
       [
         'homepage',
@@ -500,8 +597,171 @@ describe('snapshots/public-homepage', () => {
         now,
         JSON.stringify(buildHomepageRenderArtifact(payload)),
         now,
+        now + 60,
       ],
     ]);
+  });
+
+  it('returns false and keeps the previous base snapshot cached state when the upsert is a no-op', async () => {
+    vi.mocked(acquireLease).mockResolvedValue(true);
+
+    const now = 1_728_000_045;
+    const previousPayload = samplePayload(now + 30);
+    const nextPayload = samplePayload(now);
+    const db = createFakeD1Database([
+      {
+        match: 'select key, generated_at, updated_at, body_json from public_snapshots',
+        all: () => [
+          {
+            key: 'homepage',
+            generated_at: previousPayload.generated_at,
+            updated_at: previousPayload.generated_at,
+            body_json: JSON.stringify(previousPayload),
+          },
+          {
+            key: 'homepage:artifact',
+            generated_at: previousPayload.generated_at,
+            updated_at: previousPayload.generated_at,
+            body_json: JSON.stringify(buildHomepageRenderArtifact(previousPayload)),
+          },
+        ],
+      },
+      {
+        match: 'insert into public_snapshots',
+        run: () => ({ meta: { changes: 0 } }),
+      },
+    ]);
+
+    const compute = vi.fn(async () => nextPayload);
+    const refreshed = await refreshPublicHomepageSnapshotIfNeeded({
+      db,
+      now,
+      compute,
+      force: true,
+    });
+    const baseSnapshot = await readHomepageRefreshBaseSnapshot(db, now);
+
+    expect(refreshed).toBe(false);
+    expect(compute).toHaveBeenCalledTimes(1);
+    expect(baseSnapshot.generatedAt).toBe(previousPayload.generated_at);
+    expect(baseSnapshot.snapshot).toEqual(previousPayload);
+  });
+
+  it('releases the homepage refresh lease when compute fails', async () => {
+    vi.mocked(acquireLease).mockResolvedValue(true);
+
+    const now = 1_728_000_180;
+    vi.spyOn(Date, 'now').mockReturnValue(now * 1000);
+    const db = createFakeD1Database([
+      {
+        match: 'from public_snapshots',
+        first: () => ({
+          generated_at: now - 120,
+          body_json: JSON.stringify(samplePayload(now - 120)),
+        }),
+      },
+    ]);
+
+    const compute = vi.fn(async () => {
+      throw new Error('boom');
+    });
+
+    await expect(
+      refreshPublicHomepageSnapshotIfNeeded({ db, now, compute, force: true }),
+    ).rejects.toThrow('boom');
+    expect(releaseLease).toHaveBeenCalledWith(db, 'snapshot:homepage:refresh', now + 55);
+  });
+
+  it('renews the homepage refresh lease during long-running refreshes', async () => {
+    vi.useFakeTimers();
+    vi.mocked(acquireLease).mockResolvedValue(true);
+    vi.mocked(renewLease).mockResolvedValue(true);
+
+    const now = 1_728_000_240;
+    vi.setSystemTime(now * 1000);
+
+    const db = createFakeD1Database([
+      {
+        match: 'insert into public_snapshots',
+        run: () => ({ meta: { changes: 1 } }),
+      },
+    ]);
+
+    let resolveCompute: ((value: ReturnType<typeof samplePayload>) => void) | null = null;
+    const compute = vi.fn(
+      () =>
+        new Promise<ReturnType<typeof samplePayload>>((resolve) => {
+          resolveCompute = resolve;
+        }),
+    );
+
+    const refreshPromise = refreshPublicHomepageSnapshotIfNeeded({
+      db,
+      now,
+      compute,
+      force: true,
+    });
+
+    await vi.advanceTimersByTimeAsync(45_000);
+
+    expect(renewLease).toHaveBeenCalledWith(
+      db,
+      'snapshot:homepage:refresh',
+      now + 55,
+      now + 100,
+    );
+
+    resolveCompute?.(samplePayload(now));
+    await refreshPromise;
+
+    expect(releaseLease).toHaveBeenCalledWith(db, 'snapshot:homepage:refresh', now + 100);
+  });
+
+  it('fails closed when the homepage refresh helper loses its lease before writes', async () => {
+    vi.useFakeTimers();
+    vi.mocked(acquireLease).mockResolvedValue(true);
+    vi.mocked(renewLease).mockResolvedValue(false);
+
+    const now = 1_728_000_240;
+    vi.setSystemTime(now * 1000);
+    let writes = 0;
+    const db = createFakeD1Database([
+      {
+        match: 'insert into public_snapshots',
+        run: () => {
+          writes += 1;
+          return { meta: { changes: 1 } };
+        },
+      },
+    ]);
+
+    let resolveCompute: ((value: ReturnType<typeof samplePayload>) => void) | null = null;
+    const compute = vi.fn(
+      () =>
+        new Promise<ReturnType<typeof samplePayload>>((resolve) => {
+          resolveCompute = resolve;
+        }),
+    );
+
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    try {
+      const refreshPromise = refreshPublicHomepageSnapshotIfNeeded({
+        db,
+        now,
+        compute,
+        force: true,
+      });
+
+      await vi.advanceTimersByTimeAsync(45_000);
+      resolveCompute?.(samplePayload(now));
+
+      await expect(refreshPromise).resolves.toBe(false);
+      expect(writes).toBe(0);
+      expect(releaseLease).toHaveBeenCalledWith(db, 'snapshot:homepage:refresh', now + 55);
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it('prefers the freshest valid same-day snapshot as the internal refresh base snapshot', async () => {
@@ -828,6 +1088,7 @@ describe('snapshots/public-homepage', () => {
     let artifactGeneratedAt = 1_728_000_001;
     const writtenArgs: unknown[][] = [];
     const now = 1_728_000_120;
+    vi.spyOn(Date, 'now').mockReturnValue(now * 1000);
     const payload = {
       ...samplePayload(now),
       bootstrap_mode: 'full' as const,
@@ -866,9 +1127,10 @@ describe('snapshots/public-homepage', () => {
 
     expect(refreshed).toBe(true);
     expect(acquireLease).toHaveBeenCalledWith(db, 'snapshot:homepage:refresh', now, 55);
+    expect(releaseLease).toHaveBeenCalledWith(db, 'snapshot:homepage:refresh', now + 55);
     expect(compute).toHaveBeenCalledTimes(1);
     expect(writtenArgs).toEqual([
-      ['homepage:artifact', now, JSON.stringify(buildHomepageRenderArtifact(payload)), now],
+      ['homepage:artifact', now, JSON.stringify(buildHomepageRenderArtifact(payload)), now, now + 60],
     ]);
   });
 
@@ -877,6 +1139,7 @@ describe('snapshots/public-homepage', () => {
 
     const writtenArgs: unknown[][] = [];
     const now = 1_728_000_120;
+    vi.spyOn(Date, 'now').mockReturnValue(now * 1000);
     const payload = samplePayload(now);
     const db = createFakeD1Database([
       {
@@ -905,8 +1168,10 @@ describe('snapshots/public-homepage', () => {
 
     expect(refreshed).toBe(true);
     expect(compute).toHaveBeenCalledTimes(1);
+    expect(releaseLease).toHaveBeenCalledWith(db, 'snapshot:homepage:refresh', now + 55);
     expect(writtenArgs).toEqual([
-      ['homepage:artifact', now, JSON.stringify(buildHomepageRenderArtifact(payload)), now],
+      ['homepage:artifact', now, JSON.stringify(buildHomepageRenderArtifact(payload)), now, now + 60],
     ]);
   });
+
 });

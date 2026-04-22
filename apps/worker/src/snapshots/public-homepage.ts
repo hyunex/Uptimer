@@ -1,6 +1,7 @@
 import { AppError } from '../middleware/errors';
 import type { Trace } from '../observability/trace';
-import { acquireLease } from '../scheduler/lock';
+import { acquireLease, releaseLease } from '../scheduler/lock';
+import { LeaseLostError, startRenewableLease } from '../scheduler/lease-guard';
 import { primeHomepageRefreshBaseSnapshotCache } from './public-homepage-read';
 import {
   publicHomepageResponseSchema,
@@ -15,6 +16,10 @@ const SNAPSHOT_ARTIFACT_KEY = 'homepage:artifact';
 const MAX_AGE_SECONDS = 60;
 const MAX_STALE_SECONDS = 10 * 60;
 const REFRESH_LOCK_NAME = 'snapshot:homepage:refresh';
+const REFRESH_LOCK_LEASE_SECONDS = 55;
+const REFRESH_LOCK_RENEW_INTERVAL_MS = 15_000;
+const REFRESH_LOCK_RENEW_MIN_REMAINING_SECONDS = 20;
+const FUTURE_SNAPSHOT_TOLERANCE_SECONDS = 60;
 const READ_SNAPSHOT_SQL = `
   SELECT generated_at, body_json
   FROM public_snapshots
@@ -28,6 +33,7 @@ const UPSERT_SNAPSHOT_SQL = `
     body_json = excluded.body_json,
     updated_at = excluded.updated_at
   WHERE excluded.generated_at >= public_snapshots.generated_at
+    OR public_snapshots.generated_at > ?5
 `;
 const UPSERT_SNAPSHOT_ROWS_SQL = `
   INSERT INTO public_snapshots (key, generated_at, body_json, updated_at)
@@ -39,6 +45,7 @@ const UPSERT_SNAPSHOT_ROWS_SQL = `
     body_json = excluded.body_json,
     updated_at = excluded.updated_at
   WHERE excluded.generated_at >= public_snapshots.generated_at
+    OR public_snapshots.generated_at > ?9
 `;
 
 const SPLIT_SNAPSHOT_VERSION = 3;
@@ -566,6 +573,9 @@ function readSnapshotValueFromRows<T>(opts: {
   let freshest: { value: T; age: number } | null = null;
 
   for (const row of opts.rows) {
+    if (row.generated_at > opts.now + FUTURE_SNAPSHOT_TOLERANCE_SECONDS) {
+      continue;
+    }
     const age = Math.max(0, opts.now - row.generated_at);
     if (age > opts.maxAgeSeconds) {
       continue;
@@ -779,7 +789,8 @@ function homepageSnapshotUpsertStatement(
   key: string,
   generatedAt: number,
   bodyJson: string,
-  now: number,
+  updatedAt: number,
+  futureCutoffAt: number,
 ): D1PreparedStatement {
   const cached = upsertSnapshotStatementByDb.get(db);
   const statement = cached ?? db.prepare(UPSERT_SNAPSHOT_SQL);
@@ -787,7 +798,7 @@ function homepageSnapshotUpsertStatement(
     upsertSnapshotStatementByDb.set(db, statement);
   }
 
-  return statement.bind(key, generatedAt, bodyJson, now);
+  return statement.bind(key, generatedAt, bodyJson, updatedAt, futureCutoffAt);
 }
 
 function homepageSnapshotRowsUpsertStatement(
@@ -804,6 +815,7 @@ function homepageSnapshotRowsUpsertStatement(
     bodyJson: string;
     updatedAt: number;
   },
+  futureCutoffAt: number,
 ): D1PreparedStatement {
   const cached = upsertSnapshotRowsStatementByDb.get(db);
   const statement = cached ?? db.prepare(UPSERT_SNAPSHOT_ROWS_SQL);
@@ -820,8 +832,42 @@ function homepageSnapshotRowsUpsertStatement(
     artifact.generatedAt,
     artifact.bodyJson,
     artifact.updatedAt,
+    futureCutoffAt,
   );
 }
+
+function didApplySnapshotWrite(
+  result: Awaited<ReturnType<D1PreparedStatement['run']>>,
+): boolean {
+  const changes = result?.meta?.changes;
+  if (typeof changes === 'number' && Number.isFinite(changes)) {
+    return changes > 0;
+  }
+  return true;
+}
+
+async function releaseRefreshLease(
+  db: D1Database,
+  trace: Trace | undefined,
+  spanName: string,
+  lease: ReturnType<typeof startRenewableLease>,
+): Promise<void> {
+  try {
+    await lease.stop();
+  } catch (err) {
+    console.warn('homepage snapshot: failed to stop refresh lease renewal', err);
+  }
+
+  try {
+    await withTraceAsync(trace, spanName, async () =>
+      await releaseLease(db, REFRESH_LOCK_NAME, lease.getExpiresAt()),
+    );
+  } catch (err) {
+    console.warn('homepage snapshot: failed to release refresh lease', err);
+  }
+}
+
+type HomepageRefreshLeaseGuard = Pick<ReturnType<typeof startRenewableLease>, 'assertHeld'>;
 
 export async function writeHomepageSnapshot(
   db: D1Database,
@@ -829,7 +875,7 @@ export async function writeHomepageSnapshot(
   payload: PublicHomepageResponse,
   trace?: Trace,
   _seedDataSnapshot = false,
-): Promise<void> {
+): Promise<boolean> {
   const payloadBodyJson = withTraceSync(trace, 'homepage_write_stringify_payload', () =>
     JSON.stringify(payload),
   );
@@ -840,7 +886,7 @@ export async function writeHomepageSnapshot(
     JSON.stringify(render),
   );
 
-  await withTraceAsync(trace, 'homepage_write_batch', async () => {
+  const writeResult = await withTraceAsync(trace, 'homepage_write_batch', async () =>
     await homepageSnapshotRowsUpsertStatement(
       db,
       {
@@ -855,8 +901,13 @@ export async function writeHomepageSnapshot(
         bodyJson: renderBodyJson,
         updatedAt: now,
       },
-    ).run();
-  });
+      now + FUTURE_SNAPSHOT_TOLERANCE_SECONDS,
+    ).run(),
+  );
+  const wrote = didApplySnapshotWrite(writeResult);
+  if (!wrote) {
+    return false;
+  }
 
   primeHomepageRefreshBaseSnapshotCache({
     db,
@@ -866,6 +917,7 @@ export async function writeHomepageSnapshot(
     renderBodyJson,
     payloadBodyJson,
   });
+  return true;
 }
 
 export async function writeHomepageArtifactSnapshot(
@@ -873,7 +925,7 @@ export async function writeHomepageArtifactSnapshot(
   now: number,
   payload: PublicHomepageResponse,
   trace?: Trace,
-): Promise<void> {
+): Promise<boolean> {
   const render = withTraceSync(trace, 'homepage_artifact_write_render', () =>
     buildHomepageRenderArtifact(payload),
   );
@@ -881,15 +933,20 @@ export async function writeHomepageArtifactSnapshot(
     JSON.stringify(render),
   );
 
-  await withTraceAsync(trace, 'homepage_artifact_write_run', async () =>
+  const writeResult = await withTraceAsync(trace, 'homepage_artifact_write_run', async () =>
     await homepageSnapshotUpsertStatement(
       db,
       SNAPSHOT_ARTIFACT_KEY,
       render.generated_at,
       renderBodyJson,
       now,
+      now + FUTURE_SNAPSHOT_TOLERANCE_SECONDS,
     ).run(),
   );
+  const wrote = didApplySnapshotWrite(writeResult);
+  if (!wrote) {
+    return false;
+  }
 
   primeHomepageRefreshBaseSnapshotCache({
     db,
@@ -898,6 +955,7 @@ export async function writeHomepageArtifactSnapshot(
     snapshot: payload,
     renderBodyJson,
   });
+  return true;
 }
 
 export function applyHomepageCacheHeaders(res: Response, ageSeconds: number): void {
@@ -925,14 +983,17 @@ export async function refreshPublicHomepageSnapshot(opts: {
   compute: () => Promise<unknown>;
   trace?: Trace;
   seedDataSnapshot?: boolean;
-}): Promise<void> {
+  lease?: HomepageRefreshLeaseGuard;
+}): Promise<boolean> {
+  opts.lease?.assertHeld('computing homepage snapshot');
   const computed = await withTraceAsync(opts.trace, 'homepage_refresh_compute', async () =>
     await opts.compute(),
   );
   const payload = withTraceSync(opts.trace, 'homepage_refresh_validate', () =>
     toHomepageSnapshotPayload(computed),
   );
-  await writeHomepageSnapshot(
+  opts.lease?.assertHeld('writing homepage snapshot');
+  return await writeHomepageSnapshot(
     opts.db,
     opts.now,
     payload,
@@ -946,7 +1007,9 @@ export async function refreshPublicHomepageArtifactSnapshot(opts: {
   now: number;
   compute: () => Promise<unknown>;
   trace?: Trace;
-}): Promise<void> {
+  lease?: HomepageRefreshLeaseGuard;
+}): Promise<boolean> {
+  opts.lease?.assertHeld('computing homepage artifact snapshot');
   const computed = await withTraceAsync(
     opts.trace,
     'homepage_artifact_refresh_compute',
@@ -955,7 +1018,8 @@ export async function refreshPublicHomepageArtifactSnapshot(opts: {
   const payload = withTraceSync(opts.trace, 'homepage_artifact_refresh_validate', () =>
     toHomepageSnapshotPayload(computed),
   );
-  await writeHomepageArtifactSnapshot(opts.db, opts.now, payload, opts.trace);
+  opts.lease?.assertHeld('writing homepage artifact snapshot');
+  return await writeHomepageArtifactSnapshot(opts.db, opts.now, payload, opts.trace);
 }
 
 export async function refreshPublicHomepageSnapshotIfNeeded(opts: {
@@ -978,27 +1042,53 @@ export async function refreshPublicHomepageSnapshotIfNeeded(opts: {
   }
 
   const acquired = await withTraceAsync(opts.trace, 'homepage_refresh_lease', async () =>
-    await acquireLease(opts.db, REFRESH_LOCK_NAME, opts.now, 55),
+    await acquireLease(opts.db, REFRESH_LOCK_NAME, opts.now, REFRESH_LOCK_LEASE_SECONDS),
   );
   if (!acquired) {
     return false;
   }
+  const refreshLease = startRenewableLease({
+    db: opts.db,
+    name: REFRESH_LOCK_NAME,
+    leaseSeconds: REFRESH_LOCK_LEASE_SECONDS,
+    initialExpiresAt: opts.now + REFRESH_LOCK_LEASE_SECONDS,
+    renewIntervalMs: REFRESH_LOCK_RENEW_INTERVAL_MS,
+    renewMinRemainingSeconds: REFRESH_LOCK_RENEW_MIN_REMAINING_SECONDS,
+    logPrefix: 'homepage refresh',
+  });
 
-  if (!opts.force) {
-    const latestGeneratedAt = await withTraceAsync(
-      opts.trace,
-      'homepage_refresh_read_generated_at_2',
-      async () => await readHomepageSnapshotGeneratedAt(opts.db),
+  try {
+    if (!opts.force) {
+      const latestGeneratedAt = await withTraceAsync(
+        opts.trace,
+        'homepage_refresh_read_generated_at_2',
+        async () => await readHomepageSnapshotGeneratedAt(opts.db),
+      );
+      if (latestGeneratedAt !== null && isSameMinute(latestGeneratedAt, opts.now)) {
+        return false;
+      }
+    }
+
+    const wrote = await withTraceAsync(opts.trace, 'homepage_refresh_write', async () =>
+      await refreshPublicHomepageSnapshot({
+        ...opts,
+        lease: refreshLease,
+      }),
     );
-    if (latestGeneratedAt !== null && isSameMinute(latestGeneratedAt, opts.now)) {
+    return wrote;
+  } catch (err) {
+    if (err instanceof LeaseLostError) {
       return false;
     }
+    throw err;
+  } finally {
+    await releaseRefreshLease(
+      opts.db,
+      opts.trace,
+      'homepage_refresh_release_lease',
+      refreshLease,
+    );
   }
-
-  await withTraceAsync(opts.trace, 'homepage_refresh_write', async () =>
-    await refreshPublicHomepageSnapshot(opts),
-  );
-  return true;
 }
 
 export async function refreshPublicHomepageArtifactSnapshotIfNeeded(opts: {
@@ -1017,23 +1107,49 @@ export async function refreshPublicHomepageArtifactSnapshotIfNeeded(opts: {
   }
 
   const acquired = await withTraceAsync(opts.trace, 'homepage_artifact_refresh_lease', async () =>
-    await acquireLease(opts.db, REFRESH_LOCK_NAME, opts.now, 55),
+    await acquireLease(opts.db, REFRESH_LOCK_NAME, opts.now, REFRESH_LOCK_LEASE_SECONDS),
   );
   if (!acquired) {
     return false;
   }
+  const refreshLease = startRenewableLease({
+    db: opts.db,
+    name: REFRESH_LOCK_NAME,
+    leaseSeconds: REFRESH_LOCK_LEASE_SECONDS,
+    initialExpiresAt: opts.now + REFRESH_LOCK_LEASE_SECONDS,
+    renewIntervalMs: REFRESH_LOCK_RENEW_INTERVAL_MS,
+    renewMinRemainingSeconds: REFRESH_LOCK_RENEW_MIN_REMAINING_SECONDS,
+    logPrefix: 'homepage artifact refresh',
+  });
 
-  const latestGeneratedAt = await withTraceAsync(
-    opts.trace,
-    'homepage_artifact_refresh_read_generated_at_2',
-    async () => await readHomepageArtifactSnapshotGeneratedAt(opts.db),
-  );
-  if (latestGeneratedAt !== null && isSameMinute(latestGeneratedAt, opts.now)) {
-    return false;
+  try {
+    const latestGeneratedAt = await withTraceAsync(
+      opts.trace,
+      'homepage_artifact_refresh_read_generated_at_2',
+      async () => await readHomepageArtifactSnapshotGeneratedAt(opts.db),
+    );
+    if (latestGeneratedAt !== null && isSameMinute(latestGeneratedAt, opts.now)) {
+      return false;
+    }
+
+    const wrote = await withTraceAsync(opts.trace, 'homepage_artifact_refresh_write', async () =>
+      await refreshPublicHomepageArtifactSnapshot({
+        ...opts,
+        lease: refreshLease,
+      }),
+    );
+    return wrote;
+  } catch (err) {
+    if (err instanceof LeaseLostError) {
+      return false;
+    }
+    throw err;
+  } finally {
+    await releaseRefreshLease(
+      opts.db,
+      opts.trace,
+      'homepage_artifact_refresh_release_lease',
+      refreshLease,
+    );
   }
-
-  await withTraceAsync(opts.trace, 'homepage_artifact_refresh_write', async () =>
-    await refreshPublicHomepageArtifactSnapshot(opts),
-  );
-  return true;
 }

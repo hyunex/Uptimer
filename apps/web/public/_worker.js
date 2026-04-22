@@ -6,20 +6,321 @@ const TRACE_HEADER = 'X-Uptimer-Trace';
 const TRACE_ID_HEADER = 'X-Uptimer-Trace-Id';
 const TRACE_TOKEN_HEADER = 'X-Uptimer-Trace-Token';
 const TRACE_MODE_HEADER = 'X-Uptimer-Trace-Mode';
+const API_PREFIX = '/api';
+const API_VERSION_PREFIX = '/api/v1';
+const CORS_ALLOW_METHODS = 'GET,POST,PUT,PATCH,DELETE,OPTIONS';
+const CORS_ALLOW_HEADERS = 'Authorization,Content-Type';
+const HOMEPAGE_FUTURE_TOLERANCE_SECONDS = 60;
+const API_PATH_MAX_DECODE_PASSES = 32;
+
+function normalizeApiPathname(pathname) {
+  const collapsed = String(pathname || '')
+    .replace(/\\/g, '/')
+    .replace(/\/{2,}/g, '/');
+  if (!collapsed) return '/';
+  if (collapsed.length === 1) return collapsed;
+  return collapsed.replace(/\/+$/, '') || '/';
+}
+
+function isHexDigit(char) {
+  return typeof char === 'string' && /^[0-9a-f]$/i.test(char);
+}
+
+function hasInvalidPercentEncoding(pathname) {
+  const value = String(pathname || '');
+  for (let index = 0; index < value.length; index += 1) {
+    if (value[index] !== '%') continue;
+    if (!isHexDigit(value[index + 1]) || !isHexDigit(value[index + 2])) {
+      return true;
+    }
+    index += 2;
+  }
+  return false;
+}
+
+function decodeApiPathname(pathname) {
+  let decoded = String(pathname || '');
+  const maxPasses = Math.max(
+    1,
+    Math.min(API_PATH_MAX_DECODE_PASSES, Math.ceil(decoded.length / 3) + 1),
+  );
+  for (let index = 0; index < maxPasses; index += 1) {
+    try {
+      const next = decodeURIComponent(decoded);
+      if (next === decoded) break;
+      decoded = next;
+    } catch {
+      break;
+    }
+  }
+  return decoded;
+}
+
+function canonicalizeApiPathname(pathname) {
+  const normalizedPathname = normalizeApiPathname(
+    decodeApiPathname(pathname).replace(/[\u0000-\u001f\u007f]+/g, ''),
+  );
+  try {
+    return normalizeApiPathname(new URL(normalizedPathname, 'https://uptimer.invalid').pathname);
+  } catch {
+    return normalizedPathname;
+  }
+}
+
+function resolveApiRequestPath(pathname) {
+  const normalizedRawPathname = normalizeApiPathname(pathname).replace(/[\u0000-\u001f\u007f]+/g, '');
+  if (
+    normalizedRawPathname !== API_PREFIX &&
+    !normalizedRawPathname.startsWith(`${API_PREFIX}/`)
+  ) {
+    return null;
+  }
+  if (hasInvalidPercentEncoding(normalizedRawPathname)) {
+    return {
+      normalizedPathname: normalizedRawPathname,
+      canonicalPathname: normalizedRawPathname,
+      needsVersionRedirect: false,
+      invalidEncoding: true,
+    };
+  }
+
+  const normalizedPathname = canonicalizeApiPathname(pathname);
+
+  const needsVersionRedirect =
+    normalizedPathname !== API_VERSION_PREFIX &&
+    !normalizedPathname.startsWith(`${API_VERSION_PREFIX}/`);
+  const canonicalPathname = needsVersionRedirect
+    ? `${API_VERSION_PREFIX}${normalizedPathname.slice(API_PREFIX.length)}`
+    : normalizedPathname;
+
+  return {
+    normalizedPathname,
+    canonicalPathname,
+    needsVersionRedirect,
+  };
+}
 
 function isApiRequest(url) {
-  return url.pathname === '/api/v1' || url.pathname.startsWith('/api/v1/');
+  return resolveApiRequestPath(url.pathname) !== null;
+}
+
+function hasNonEmptyHeader(request, name) {
+  const value = request.headers.get(name);
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+function isInternalApiPath(pathname) {
+  const canonicalPathname = normalizeApiPathname(pathname);
+  return canonicalPathname === '/api/v1/internal' || canonicalPathname.startsWith('/api/v1/internal/');
+}
+
+function isGetOnlyPublicApiPath(pathname) {
+  const canonicalPathname = normalizeApiPathname(pathname);
+  return canonicalPathname === '/api/v1/public' || canonicalPathname.startsWith('/api/v1/public/');
+}
+
+function isAllowedApiOriginUrl(url) {
+  if (url.protocol === 'https:') return true;
+  return url.protocol === 'http:' && isLocalApiHost(url.hostname);
+}
+
+function resolveApiOriginUrl(env) {
+  const apiOrigin = typeof env?.UPTIMER_API_ORIGIN === 'string' ? env.UPTIMER_API_ORIGIN.trim() : '';
+  if (!apiOrigin) return null;
+
+  try {
+    const url = new URL(apiOrigin);
+    if (!isAllowedApiOriginUrl(url)) return null;
+    if (url.username || url.password || url.search || url.hash) return null;
+    url.pathname = '/';
+    return url;
+  } catch {
+    return null;
+  }
 }
 
 function resolveApiOrigin(env) {
-  const apiOrigin = typeof env?.UPTIMER_API_ORIGIN === 'string' ? env.UPTIMER_API_ORIGIN.trim() : '';
-  return apiOrigin || null;
+  const url = resolveApiOriginUrl(env);
+  return url ? url.toString() : null;
 }
 
-function buildApiProxyUrl(url, env) {
-  const apiOrigin = resolveApiOrigin(env);
-  if (!apiOrigin) return null;
-  return new URL(`${url.pathname}${url.search}`, apiOrigin);
+function resolveSensitiveApiOriginUrl(env) {
+  const sensitiveOrigin =
+    typeof env?.UPTIMER_API_SENSITIVE_ORIGIN === 'string'
+      ? env.UPTIMER_API_SENSITIVE_ORIGIN.trim()
+      : '';
+  if (!sensitiveOrigin) return null;
+  try {
+    const url = new URL(sensitiveOrigin);
+    if (!isAllowedApiOriginUrl(url)) return null;
+    if (url.username || url.password || url.search || url.hash) return null;
+    url.pathname = '/';
+    return url;
+  } catch {
+    return null;
+  }
+}
+
+function buildApiProxyUrl(url, env, apiOriginOverride, apiPathname) {
+  const apiOrigin = apiOriginOverride || resolveApiOriginUrl(env);
+  const apiPath =
+    typeof apiPathname === 'string' ? apiPathname : resolveApiRequestPath(url.pathname)?.canonicalPathname;
+  if (!apiOrigin || !apiPath) return null;
+  return new URL(`${apiPath}${url.search}`, apiOrigin);
+}
+
+function isLocalApiHost(hostname) {
+  return (
+    hostname === 'localhost' ||
+    hostname === '127.0.0.1' ||
+    hostname === '[::1]' ||
+    hostname.endsWith('.localhost')
+  );
+}
+
+function canForwardSensitiveHeaders(upstreamUrl, requestUrl, trustedSensitiveOriginUrl = null) {
+  if (trustedSensitiveOriginUrl) {
+    return upstreamUrl.origin === trustedSensitiveOriginUrl.origin;
+  }
+  if (upstreamUrl.origin === requestUrl.origin) return true;
+  if (isLocalApiHost(upstreamUrl.hostname)) return true;
+  return false;
+}
+
+function hasSensitiveProxyHeaders(request) {
+  return hasNonEmptyHeader(request, 'Authorization') || hasNonEmptyHeader(request, TRACE_TOKEN_HEADER);
+}
+
+function normalizeHeaderName(name) {
+  return String(name).trim().toLowerCase();
+}
+
+function appendVaryHeader(headers, value) {
+  const next = String(value || '').trim();
+  if (!next) return;
+  const existing = headers.get('Vary');
+  if (!existing) {
+    headers.set('Vary', next);
+    return;
+  }
+  const normalized = next.toLowerCase();
+  const parts = existing.split(',').map((part) => part.trim().toLowerCase());
+  if (parts.includes(normalized)) return;
+  headers.set('Vary', `${existing}, ${next}`);
+}
+
+function parseConnectionHeaderTokens(value) {
+  const tokens = new Set();
+  if (typeof value !== 'string') return tokens;
+  for (const part of value.split(',')) {
+    const normalized = normalizeHeaderName(part);
+    if (!normalized) continue;
+    tokens.add(normalized);
+  }
+  return tokens;
+}
+
+function shouldStripProxyHeader(name) {
+  const normalized = normalizeHeaderName(name);
+  if (!normalized) return false;
+  if (normalized === 'host') return true;
+  if (normalized.startsWith('cf-')) return true;
+  if (normalized === 'cookie' || normalized === 'cookie2') return true;
+  if (normalized === 'proxy-authorization') return true;
+  if (normalized === 'connection' || normalized === 'keep-alive') return true;
+  if (normalized === 'te' || normalized === 'trailer') return true;
+  if (normalized === 'transfer-encoding' || normalized === 'upgrade') return true;
+  if (normalized === 'proxy-connection') return true;
+  if (normalized === 'forwarded' || normalized === 'x-forwarded-for') return true;
+  if (normalized === 'x-real-ip' || normalized === 'true-client-ip') return true;
+  if (normalized === 'cf-connecting-ip') return true;
+  if (normalized.startsWith('x-forwarded-')) return true;
+  return false;
+}
+
+function shouldStripProxyResponseHeader(name) {
+  const normalized = normalizeHeaderName(name);
+  if (!normalized) return false;
+  if (normalized === 'connection' || normalized === 'keep-alive') return true;
+  if (normalized === 'proxy-connection') return true;
+  if (normalized === 'proxy-authenticate' || normalized === 'proxy-authorization') return true;
+  if (normalized === 'te' || normalized === 'trailer') return true;
+  if (normalized === 'transfer-encoding' || normalized === 'upgrade') return true;
+  return false;
+}
+
+function buildApiProxyRequest(request, upstreamUrl) {
+  const connectionTokens = parseConnectionHeaderTokens(request.headers.get('Connection'));
+  const headers = new Headers();
+  for (const [name, value] of request.headers.entries()) {
+    const normalized = normalizeHeaderName(name);
+    if (connectionTokens.has(normalized)) continue;
+    if (shouldStripProxyHeader(name)) continue;
+    headers.set(name, value);
+  }
+
+  const hasBody = request.method !== 'GET' && request.method !== 'HEAD';
+  return new Request(upstreamUrl.toString(), {
+    method: request.method,
+    headers,
+    body: hasBody ? request.body : undefined,
+    redirect: 'manual',
+    duplex: hasBody ? 'half' : undefined,
+  });
+}
+
+function sanitizeApiProxyResponse(upstreamResponse) {
+  if (upstreamResponse.status >= 300 && upstreamResponse.status < 400) {
+    const headers = new Headers({
+      'Content-Type': 'application/json; charset=utf-8',
+      'Cache-Control': 'no-store',
+    });
+    return new Response(
+      JSON.stringify({
+        error: {
+          code: 'UPSTREAM_REDIRECT_BLOCKED',
+          message: 'Upstream redirects are not allowed through the Pages API proxy',
+        },
+      }),
+      {
+        status: 502,
+        headers,
+      },
+    );
+  }
+
+  const headers = new Headers(upstreamResponse.headers);
+  const connectionTokens = parseConnectionHeaderTokens(headers.get('Connection'));
+  for (const token of connectionTokens) {
+    headers.delete(token);
+  }
+  for (const name of Array.from(headers.keys())) {
+    if (shouldStripProxyResponseHeader(name)) {
+      headers.delete(name);
+    }
+  }
+  headers.delete('Set-Cookie');
+  headers.delete('Set-Cookie2');
+  return new Response(upstreamResponse.body, {
+    status: upstreamResponse.status,
+    statusText: upstreamResponse.statusText,
+    headers,
+  });
+}
+
+function applySensitiveProxyResponsePolicy(res, request) {
+  if (!hasSensitiveProxyHeaders(request)) {
+    return res;
+  }
+
+  if (hasNonEmptyHeader(request, 'Authorization')) {
+    appendVaryHeader(res.headers, 'Authorization');
+  }
+  if (hasNonEmptyHeader(request, TRACE_TOKEN_HEADER)) {
+    appendVaryHeader(res.headers, TRACE_TOKEN_HEADER);
+  }
+  res.headers.set('Cache-Control', 'private, no-store');
+  return res;
 }
 
 function jsonError(status, code, message) {
@@ -30,6 +331,33 @@ function jsonError(status, code, message) {
       'Cache-Control': 'no-store',
     },
   });
+}
+
+function applyApiCorsHeaders(res, request, canonicalPathname) {
+  const out = new Response(res.body, res);
+  const origin = request.headers.get('Origin');
+  appendVaryHeader(out.headers, 'Origin');
+  if (origin) {
+    out.headers.set('Access-Control-Allow-Origin', origin);
+  }
+  out.headers.set(
+    'Access-Control-Allow-Methods',
+    isGetOnlyPublicApiPath(canonicalPathname) ? 'GET, OPTIONS' : CORS_ALLOW_METHODS,
+  );
+  out.headers.set('Access-Control-Allow-Headers', CORS_ALLOW_HEADERS);
+  return out;
+}
+
+function buildApiPreflightResponse(request, canonicalPathname) {
+  return applyApiCorsHeaders(new Response(null, { status: 204 }), request, canonicalPathname);
+}
+
+function buildApiMethodNotAllowedResponse(request, canonicalPathname) {
+  const allowedMethods = isGetOnlyPublicApiPath(canonicalPathname) ? 'GET, OPTIONS' : CORS_ALLOW_METHODS;
+  const res = jsonError(405, 'METHOD_NOT_ALLOWED', 'Method Not Allowed');
+  res.headers.set('Allow', allowedMethods);
+  res.headers.set('Cache-Control', 'no-store');
+  return applyApiCorsHeaders(res, request, canonicalPathname);
 }
 
 function acceptsHtml(request) {
@@ -217,6 +545,58 @@ function safeJsonForInlineScript(value) {
   return JSON.stringify(value).replace(/</g, '\\u003c');
 }
 
+function sanitizeInlineJsonText(jsonText) {
+  if (typeof jsonText !== 'string') return null;
+  const trimmed = jsonText.trim();
+  if (!trimmed) return null;
+  try {
+    return safeJsonForInlineScript(JSON.parse(trimmed));
+  } catch {
+    return null;
+  }
+}
+
+function sanitizeHtmlResponseHeaders(headers) {
+  const next = new Headers(headers);
+  next.delete('Set-Cookie');
+  next.delete('Set-Cookie2');
+  return next;
+}
+
+function buildSanitizedHtmlResponse(response) {
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: sanitizeHtmlResponseHeaders(response.headers),
+  });
+}
+
+function normalizeHomepageGeneratedAt(value, now) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return null;
+  const generatedAt = Math.trunc(value);
+  if (generatedAt > now + HOMEPAGE_FUTURE_TOLERANCE_SECONDS) {
+    return null;
+  }
+  return generatedAt;
+}
+
+function computeHomepageAge(now, generatedAt) {
+  const normalizedGeneratedAt = normalizeHomepageGeneratedAt(generatedAt, now);
+  if (normalizedGeneratedAt === null) return null;
+  return Math.max(0, now - normalizedGeneratedAt);
+}
+
+function sanitizeHomepagePreloadHtml(value) {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  if (/<\s*script\b/i.test(trimmed)) return null;
+  if (/\bon[a-z]+\s*=/i.test(trimmed)) return null;
+  if (/\bjavascript\s*:/i.test(trimmed)) return null;
+  if (/<\s*(iframe|object|embed|foreignobject|link|meta|style)\b/i.test(trimmed)) return null;
+  return trimmed;
+}
+
 function readGeneratedAtHeader(res) {
   const raw = res.headers.get(HOMEPAGE_CACHE_GENERATED_AT_HEADER);
   if (!raw) return null;
@@ -230,14 +610,17 @@ function normalizeSnapshotText(value, fallback) {
   return trimmed.length > 0 ? trimmed : fallback;
 }
 
-function normalizeHomepageArtifactPayload(data) {
+function normalizeHomepageArtifactPayload(data, now) {
   if (!data || typeof data !== 'object') return null;
-  if (typeof data.preload_html !== 'string') return null;
+  const preloadHtml = sanitizeHomepagePreloadHtml(data.preload_html);
+  if (!preloadHtml) return null;
+  const generatedAt =
+    data.generated_at === undefined ? null : normalizeHomepageGeneratedAt(data.generated_at, now);
+  if (data.generated_at !== undefined && generatedAt === null) return null;
 
   let snapshotInlineJson = null;
   if (typeof data.snapshot_json === 'string') {
-    const trimmed = data.snapshot_json.trim();
-    snapshotInlineJson = trimmed.length > 0 ? trimmed : null;
+    snapshotInlineJson = sanitizeInlineJsonText(data.snapshot_json);
   } else if (data.snapshot && typeof data.snapshot === 'object') {
     snapshotInlineJson = safeJsonForInlineScript(data.snapshot);
   }
@@ -245,8 +628,8 @@ function normalizeHomepageArtifactPayload(data) {
   if (!snapshotInlineJson) return null;
 
   return {
-    generated_at: typeof data.generated_at === 'number' ? data.generated_at : null,
-    preload_html: data.preload_html,
+    generated_at: generatedAt,
+    preload_html: preloadHtml,
     meta_title: typeof data.meta_title === 'string' ? data.meta_title : '',
     meta_description: typeof data.meta_description === 'string' ? data.meta_description : '',
     snapshot_inline_json: snapshotInlineJson,
@@ -324,7 +707,7 @@ function canServeCachedHomepageFallback(ageSeconds) {
 function buildHomepageCacheHit(cached, ageSeconds) {
   // In the Cloudflare runtime, cached/fetched Responses can have immutable headers.
   // Always rebuild before mutating.
-  const hit = new Response(cached.body, cached);
+  const hit = buildSanitizedHtmlResponse(cached);
   hit.headers.set('Cache-Control', computeCacheControl(ageSeconds));
   hit.headers.delete(HOMEPAGE_CACHE_GENERATED_AT_HEADER);
   return hit;
@@ -423,7 +806,7 @@ async function fetchIndexHtml(env, url) {
   return env.ASSETS.fetch(req);
 }
 
-async function fetchPublicHomepageArtifact(env, trace) {
+async function fetchPublicHomepageArtifact(env, trace, now) {
   const apiOrigin = resolveApiOrigin(env);
   if (!apiOrigin) return null;
 
@@ -461,7 +844,7 @@ async function fetchPublicHomepageArtifact(env, trace) {
     const data = trace
       ? await trace.timeAsync('api_json', () => resp.json())
       : await resp.json();
-    return normalizeHomepageArtifactPayload(data);
+    return normalizeHomepageArtifactPayload(data, now);
   } catch {
     return null;
   } finally {
@@ -469,17 +852,34 @@ async function fetchPublicHomepageArtifact(env, trace) {
   }
 }
 
-async function proxyApiRequest(request, env, trace) {
+async function proxyApiRequest(request, env, trace, apiPathname) {
   const url = new URL(request.url);
-  if (url.pathname === '/api/v1/internal' || url.pathname.startsWith('/api/v1/internal/')) {
+  const resolvedPath = apiPathname || resolveApiRequestPath(url.pathname)?.canonicalPathname;
+  if (!resolvedPath) {
+    if (trace) {
+      trace.setLabel('route', 'pages/api-proxy');
+      trace.setLabel('path', 'invalid-api-path');
+    }
+    return finalizeTraceResponse(
+      applyApiCorsHeaders(jsonError(404, 'NOT_FOUND', 'Not Found'), request, '/api/v1'),
+      trace,
+    );
+  }
+
+  if (isInternalApiPath(resolvedPath)) {
     if (trace) {
       trace.setLabel('route', 'pages/api-proxy');
       trace.setLabel('path', 'internal-blocked');
     }
-    return finalizeTraceResponse(jsonError(404, 'NOT_FOUND', 'Not Found'), trace);
+    return finalizeTraceResponse(
+      applyApiCorsHeaders(jsonError(404, 'NOT_FOUND', 'Not Found'), request, resolvedPath),
+      trace,
+    );
   }
 
-  const upstreamUrl = buildApiProxyUrl(url, env);
+  const hasSensitiveHeaders = hasSensitiveProxyHeaders(request);
+  const sensitiveApiOrigin = hasSensitiveHeaders ? resolveSensitiveApiOriginUrl(env) : null;
+  const upstreamUrl = buildApiProxyUrl(url, env, sensitiveApiOrigin, resolvedPath);
 
   if (!upstreamUrl) {
     if (trace) {
@@ -487,10 +887,17 @@ async function proxyApiRequest(request, env, trace) {
       trace.setLabel('path', 'missing_origin');
     }
     return finalizeTraceResponse(
-      jsonError(
-        503,
-        'API_ORIGIN_NOT_CONFIGURED',
-        'Pages API proxy is not configured. Set UPTIMER_API_ORIGIN.',
+      applyApiCorsHeaders(
+        applySensitiveProxyResponsePolicy(
+          jsonError(
+            503,
+            'API_ORIGIN_NOT_CONFIGURED',
+            'Pages API proxy is not configured. Set UPTIMER_API_ORIGIN.',
+          ),
+          request,
+        ),
+        request,
+        resolvedPath,
       ),
       trace,
     );
@@ -498,10 +905,48 @@ async function proxyApiRequest(request, env, trace) {
 
   if (trace) {
     trace.setLabel('route', 'pages/api-proxy');
-    trace.setLabel('path', url.pathname);
+    trace.setLabel('path', resolvedPath);
   }
 
-  const upstreamRequest = new Request(upstreamUrl.toString(), request);
+  if (hasSensitiveHeaders && !canForwardSensitiveHeaders(upstreamUrl, url, sensitiveApiOrigin)) {
+    if (trace) {
+      trace.setLabel('auth_forward', hasNonEmptyHeader(request, 'Authorization') ? 'blocked' : 'none');
+      trace.setLabel(
+        'trace_token_forward',
+        hasNonEmptyHeader(request, TRACE_TOKEN_HEADER) ? 'blocked' : 'none',
+      );
+      trace.setLabel('api_host', upstreamUrl.hostname);
+    }
+    return finalizeTraceResponse(
+      applyApiCorsHeaders(
+        applySensitiveProxyResponsePolicy(
+          jsonError(
+            503,
+            'API_ORIGIN_UNTRUSTED_FOR_SENSITIVE_HEADERS',
+            'Refusing to forward sensitive headers without a trusted API origin. Set UPTIMER_API_SENSITIVE_ORIGIN or use a same-origin/local API.',
+          ),
+          request,
+        ),
+        request,
+        resolvedPath,
+      ),
+      trace,
+    );
+  }
+
+  if (trace) {
+    trace.setLabel(
+      'auth_forward',
+      hasNonEmptyHeader(request, 'Authorization') ? 'allowed' : 'none',
+    );
+    trace.setLabel(
+      'trace_token_forward',
+      hasNonEmptyHeader(request, TRACE_TOKEN_HEADER) ? 'allowed' : 'none',
+    );
+    trace.setLabel('api_host', upstreamUrl.hostname);
+  }
+
+  const upstreamRequest = buildApiProxyRequest(request, upstreamUrl);
   const upstreamResponse = trace
     ? await trace.timeAsync('api_proxy_fetch', () => fetch(upstreamRequest))
     : await fetch(upstreamRequest);
@@ -510,11 +955,25 @@ async function proxyApiRequest(request, env, trace) {
     trace.setLabel('api_status', upstreamResponse.status);
   }
 
-  return finalizeTraceResponse(new Response(upstreamResponse.body, upstreamResponse), trace);
+  const sanitizedResponse = sanitizeApiProxyResponse(upstreamResponse);
+  const response =
+    upstreamResponse.status >= 300 && upstreamResponse.status < 400
+      ? applyApiCorsHeaders(
+          applySensitiveProxyResponsePolicy(sanitizedResponse, request),
+          request,
+          resolvedPath,
+        )
+      : applySensitiveProxyResponsePolicy(sanitizedResponse, request);
+
+  return finalizeTraceResponse(response, trace);
 }
 
 export default {
   async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    const trace = resolveTraceContext(request, env);
+    const resolvedApiPath = resolveApiRequestPath(url.pathname);
+
     try {
       try {
         ctx.passThroughOnException?.();
@@ -522,11 +981,61 @@ export default {
         // ignore
       }
 
-      const url = new URL(request.url);
-      const trace = resolveTraceContext(request, env);
-
-      if (isApiRequest(url)) {
-        return proxyApiRequest(request, env, trace);
+      if (resolvedApiPath) {
+        if (resolvedApiPath.invalidEncoding) {
+          return finalizeTraceResponse(
+            applyApiCorsHeaders(
+              applySensitiveProxyResponsePolicy(jsonError(404, 'NOT_FOUND', 'Not Found'), request),
+              request,
+              resolvedApiPath.canonicalPathname,
+            ),
+            trace,
+          );
+        }
+        if (isInternalApiPath(resolvedApiPath.canonicalPathname)) {
+          return finalizeTraceResponse(
+            applyApiCorsHeaders(
+              applySensitiveProxyResponsePolicy(jsonError(404, 'NOT_FOUND', 'Not Found'), request),
+              request,
+              resolvedApiPath.canonicalPathname,
+            ),
+            trace,
+          );
+        }
+        if (request.method === 'OPTIONS') {
+          return finalizeTraceResponse(
+            applySensitiveProxyResponsePolicy(
+              buildApiPreflightResponse(request, resolvedApiPath.canonicalPathname),
+              request,
+            ),
+            trace,
+          );
+        }
+        if (request.method !== 'GET' && isGetOnlyPublicApiPath(resolvedApiPath.canonicalPathname)) {
+          return finalizeTraceResponse(
+            applySensitiveProxyResponsePolicy(
+              buildApiMethodNotAllowedResponse(request, resolvedApiPath.canonicalPathname),
+              request,
+            ),
+            trace,
+          );
+        }
+        if (resolvedApiPath.needsVersionRedirect) {
+          const next = new URL(request.url);
+          next.pathname = resolvedApiPath.canonicalPathname;
+          return finalizeTraceResponse(
+            applySensitiveProxyResponsePolicy(
+              applyApiCorsHeaders(
+                Response.redirect(next.toString(), 308),
+                request,
+                resolvedApiPath.canonicalPathname,
+              ),
+              request,
+            ),
+            trace,
+          );
+        }
+        return await proxyApiRequest(request, env, trace, resolvedApiPath.canonicalPathname);
       }
 
       // HTML requests: serve SPA entry for client-side routes.
@@ -561,11 +1070,11 @@ export default {
             if (trace) {
               trace.setLabel('path', 'cache_hit_raw');
             }
-            return finalizeTraceResponse(cached, trace);
+            return finalizeTraceResponse(buildSanitizedHtmlResponse(cached), trace);
           }
 
-          const cachedAge = Math.max(0, now - cachedGeneratedAt);
-          if (cachedAge <= SNAPSHOT_MAX_AGE_SECONDS) {
+          const cachedAge = computeHomepageAge(now, cachedGeneratedAt);
+          if (cachedAge !== null && cachedAge <= SNAPSHOT_MAX_AGE_SECONDS) {
             const hit = trace
               ? trace.time('cache_hit_build', () => buildHomepageCacheHit(cached, cachedAge))
               : buildHomepageCacheHit(cached, cachedAge);
@@ -574,6 +1083,8 @@ export default {
               trace.setLabel('age', cachedAge);
             }
             return finalizeTraceResponse(hit, trace);
+          } else if (trace && cachedAge === null) {
+            trace.setLabel('cache_invalid_future', cachedGeneratedAt);
           }
         }
 
@@ -584,32 +1095,34 @@ export default {
           ? await trace.timeAsync('index_text', () => base.text())
           : await base.text();
 
-        const artifact = await fetchPublicHomepageArtifact(env, trace);
+        const artifact = await fetchPublicHomepageArtifact(env, trace, now);
         if (!artifact) {
           if (cached) {
             const cachedGeneratedAt = readGeneratedAtHeader(cached);
-          if (cachedGeneratedAt === null) {
-            if (trace) trace.setLabel('path', 'api_fail_cache_raw');
-            return finalizeTraceResponse(cached, trace);
-          }
-          const cachedAge = Math.max(0, now - cachedGeneratedAt);
-          if (canServeCachedHomepageFallback(cachedAge)) {
-            const hit = trace
-              ? trace.time('cache_hit_build', () => buildHomepageCacheHit(cached, cachedAge))
-              : buildHomepageCacheHit(cached, cachedAge);
-            if (trace) {
-              trace.setLabel('path', 'api_fail_cache_hit');
-              trace.setLabel('age', cachedAge);
+            if (cachedGeneratedAt === null) {
+              if (trace) trace.setLabel('path', 'api_fail_cache_raw');
+              return finalizeTraceResponse(buildSanitizedHtmlResponse(cached), trace);
             }
-            return finalizeTraceResponse(hit, trace);
+            const cachedAge = computeHomepageAge(now, cachedGeneratedAt);
+            if (cachedAge !== null && canServeCachedHomepageFallback(cachedAge)) {
+              const hit = trace
+                ? trace.time('cache_hit_build', () => buildHomepageCacheHit(cached, cachedAge))
+                : buildHomepageCacheHit(cached, cachedAge);
+              if (trace) {
+                trace.setLabel('path', 'api_fail_cache_hit');
+                trace.setLabel('age', cachedAge);
+              }
+              return finalizeTraceResponse(hit, trace);
+            }
+            if (trace && cachedAge === null) {
+              trace.setLabel('cache_invalid_future', cachedGeneratedAt);
+            }
+            if (trace && cachedAge !== null) {
+              trace.setLabel('cache_stale_skip', cachedAge);
+            }
           }
-          if (trace) {
-            trace.setLabel('cache_stale_skip', cachedAge);
-          }
-        }
-
-        const headers = new Headers(base.headers);
-        headers.set('Content-Type', 'text/html; charset=utf-8');
+          const headers = new Headers(base.headers);
+          headers.set('Content-Type', 'text/html; charset=utf-8');
           headers.append('Vary', 'Accept');
           headers.delete('Location');
 
@@ -617,12 +1130,15 @@ export default {
             trace.setLabel('path', 'api_fail_index');
             trace.setLabel('html_chars', html.length);
           }
-          return finalizeTraceResponse(new Response(html, { status: 200, headers }), trace);
+          return finalizeTraceResponse(
+            new Response(html, { status: 200, headers: sanitizeHtmlResponseHeaders(headers) }),
+            trace,
+          );
         }
 
         const generatedAt =
           typeof artifact.generated_at === 'number' ? artifact.generated_at : now;
-        const age = Math.max(0, now - generatedAt);
+        const age = computeHomepageAge(now, generatedAt) ?? 0;
 
         const snapshotInlineJson = artifact.snapshot_inline_json;
 
@@ -654,7 +1170,7 @@ export default {
               `  ${HOMEPAGE_PRELOAD_STYLE_TAG}\n  <script>globalThis.__UPTIMER_INITIAL_HOMEPAGE__=${snapshotInlineJson};</script>\n</head>`,
             );
 
-        const headers = new Headers(base.headers);
+        const headers = sanitizeHtmlResponseHeaders(base.headers);
         headers.set('Content-Type', 'text/html; charset=utf-8');
         headers.set('Cache-Control', computeCacheControl(age));
         headers.append('Vary', 'Accept');
@@ -701,7 +1217,7 @@ export default {
         const indexResp = await fetchIndexHtml(env, url);
         const html = await indexResp.text();
 
-        const headers = new Headers(indexResp.headers);
+        const headers = sanitizeHtmlResponseHeaders(indexResp.headers);
         headers.set('Content-Type', 'text/html; charset=utf-8');
         headers.append('Vary', 'Accept');
         headers.delete('Location');
@@ -717,10 +1233,23 @@ export default {
         // ignore
       }
 
+      if (resolvedApiPath) {
+        return finalizeTraceResponse(
+          applySensitiveProxyResponsePolicy(
+            applyApiCorsHeaders(
+              jsonError(500, 'INTERNAL', 'Internal Server Error'),
+              request,
+              resolvedApiPath.canonicalPathname,
+            ),
+            request,
+          ),
+          trace,
+        );
+      }
+
       // Best-effort fallback for HTML navigation so we never surface a 1101.
       try {
         const wantsHtml = request.method === 'GET' && acceptsHtml(request);
-        const url = new URL(request.url);
         const isStatusPage = url.pathname === '/' || url.pathname === '/index.html';
 
         if (wantsHtml) {
@@ -731,9 +1260,9 @@ export default {
               if (cached) {
                 const now = Math.floor(Date.now() / 1000);
                 const cachedGeneratedAt = readGeneratedAtHeader(cached);
-                if (cachedGeneratedAt === null) return cached;
-                const cachedAge = Math.max(0, now - cachedGeneratedAt);
-                if (canServeCachedHomepageFallback(cachedAge)) {
+                if (cachedGeneratedAt === null) return buildSanitizedHtmlResponse(cached);
+                const cachedAge = computeHomepageAge(now, cachedGeneratedAt);
+                if (cachedAge !== null && canServeCachedHomepageFallback(cachedAge)) {
                   return buildHomepageCacheHit(cached, cachedAge);
                 }
               }
@@ -745,7 +1274,7 @@ export default {
           try {
             const indexResp = await fetchIndexHtml(env, url);
             const html = await indexResp.text();
-            const headers = new Headers(indexResp.headers);
+            const headers = sanitizeHtmlResponseHeaders(indexResp.headers);
             headers.set('Content-Type', 'text/html; charset=utf-8');
             headers.append('Vary', 'Accept');
             headers.delete('Location');

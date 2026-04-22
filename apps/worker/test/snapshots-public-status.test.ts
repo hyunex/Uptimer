@@ -10,6 +10,11 @@ import {
   toSnapshotPayload,
   writeStatusSnapshot,
 } from '../src/snapshots/public-status';
+import {
+  readStatusSnapshotJson as readStatusSnapshotJsonFastPath,
+  readStatusSnapshotPayloadAnyAge,
+  readStaleStatusSnapshotJson,
+} from '../src/snapshots/public-status-read';
 import { createFakeD1Database } from './helpers/fake-d1';
 
 function samplePayload(now = 1_728_000_000) {
@@ -232,7 +237,7 @@ describe('snapshots/public-status', () => {
     const payload = samplePayload(280);
     await writeStatusSnapshot(db, now, payload);
 
-    expect(boundArgs).toEqual(['status', 280, JSON.stringify(payload), now]);
+    expect(boundArgs).toEqual(['status', 280, JSON.stringify(payload), now, now + 60]);
   });
 
   it('does not let an older status snapshot overwrite a newer one', async () => {
@@ -265,6 +270,83 @@ describe('snapshots/public-status', () => {
       generated_at: 300,
       body_json: JSON.stringify(newerPayload),
       updated_at: 320,
+    });
+  });
+
+  it('treats future-dated status snapshots as unreadable on every read path', async () => {
+    const payload = samplePayload(1_000);
+    const db = createFakeD1Database([
+      {
+        match: 'from public_snapshots',
+        first: () => ({
+          generated_at: payload.generated_at,
+          updated_at: payload.generated_at,
+          body_json: JSON.stringify(payload),
+        }),
+      },
+    ]);
+
+    await expect(readStatusSnapshot(db, 200)).resolves.toBeNull();
+    await expect(readStatusSnapshotJson(db, 200)).resolves.toBeNull();
+    await expect(readStatusSnapshotJsonFastPath(db, 200)).resolves.toBeNull();
+    await expect(readStatusSnapshotPayloadAnyAge(db, 200)).resolves.toBeNull();
+    await expect(readStaleStatusSnapshotJson(db, 200)).resolves.toBeNull();
+  });
+
+  it('lets a fresh real status snapshot overwrite a future-dated poisoned row', async () => {
+    const rows = new Map<string, { generated_at: number; body_json: string; updated_at: number }>();
+    const db = createFakeD1Database([
+      {
+        match: 'from public_snapshots',
+        first: (args) => rows.get(args[0] as string) ?? null,
+      },
+      {
+        match: 'insert into public_snapshots',
+        run: (args) => {
+          const [key, generatedAt, bodyJson, updatedAt, futureCutoff] = args as [
+            string,
+            number,
+            string,
+            number,
+            number,
+          ];
+          const existing = rows.get(key);
+          if (
+            !existing ||
+            generatedAt >= existing.generated_at ||
+            existing.generated_at > futureCutoff
+          ) {
+            rows.set(key, {
+              generated_at: generatedAt,
+              body_json: bodyJson,
+              updated_at: updatedAt,
+            });
+          }
+          return { meta: { changes: 1 } };
+        },
+      },
+    ]);
+
+    const futurePayload = samplePayload(1_000);
+    const realPayload = samplePayload(300);
+
+    await writeStatusSnapshot(db, 100, futurePayload);
+    await expect(readStatusSnapshot(db, 100)).resolves.toBeNull();
+
+    await writeStatusSnapshot(db, 320, realPayload);
+
+    expect(rows.get('status')).toEqual({
+      generated_at: 300,
+      body_json: JSON.stringify(realPayload),
+      updated_at: 320,
+    });
+    await expect(readStatusSnapshot(db, 320)).resolves.toEqual({
+      data: realPayload,
+      age: 20,
+    });
+    await expect(readStatusSnapshotJsonFastPath(db, 320)).resolves.toEqual({
+      bodyJson: JSON.stringify(realPayload),
+      age: 20,
     });
   });
 

@@ -9,6 +9,7 @@ vi.mock('../src/monitor/tcp', () => ({
 vi.mock('../src/scheduler/lock', () => ({
   acquireLease: vi.fn(),
   releaseLease: vi.fn(),
+  renewLease: vi.fn(),
 }));
 vi.mock('../src/settings', () => ({
   readSettings: vi.fn(),
@@ -40,8 +41,12 @@ import { dispatchWebhookToChannels } from '../src/notify/webhook';
 import { computePublicHomepagePayload } from '../src/public/homepage';
 import { rebuildPublicMonitorRuntimeSnapshot } from '../src/public/monitor-runtime-bootstrap';
 import { refreshPublicMonitorRuntimeSnapshot } from '../src/public/monitor-runtime';
-import { listMonitorRowsByIds, runScheduledTick } from '../src/scheduler/scheduled';
-import { acquireLease, releaseLease } from '../src/scheduler/lock';
+import {
+  listMonitorRowsByIds,
+  runExclusivePersistedMonitorBatch,
+  runScheduledTick,
+} from '../src/scheduler/scheduled';
+import { acquireLease, releaseLease, renewLease } from '../src/scheduler/lock';
 import { refreshPublicHomepageSnapshotIfNeeded } from '../src/snapshots';
 import { readSettings } from '../src/settings';
 import { createFakeD1Database, type FakeD1QueryHandler } from './helpers/fake-d1';
@@ -149,6 +154,7 @@ describe('scheduler/scheduled regression', () => {
 
     vi.mocked(acquireLease).mockResolvedValue(true);
     vi.mocked(releaseLease).mockResolvedValue(undefined);
+    vi.mocked(renewLease).mockResolvedValue(true);
     vi.mocked(readSettings).mockResolvedValue({
       site_title: 'Uptimer',
       site_description: '',
@@ -553,6 +559,7 @@ describe('scheduler/scheduled regression', () => {
     });
     const runtimeRefreshArgs = vi.mocked(refreshPublicMonitorRuntimeSnapshot).mock.calls[0]?.[0];
     expect(runtimeRefreshArgs).toBeDefined();
+    expect(runtimeRefreshArgs).not.toHaveProperty('beforeWrite');
     await expect(runtimeRefreshArgs?.rebuild()).resolves.toEqual({
       version: 1,
       generated_at: Math.floor(Date.now() / 1000),
@@ -670,6 +677,153 @@ describe('scheduler/scheduled regression', () => {
     }
   });
 
+  it('falls back to inline homepage refresh when the internal refresh service reports refreshed=false for runtime updates', async () => {
+    const env = createEnv({
+      dueRows: [
+        {
+          id: 1,
+          name: 'API',
+          type: 'http',
+          target: 'https://example.com',
+          interval_sec: 60,
+          created_at: 1_760_000_000,
+          timeout_ms: 10_000,
+          http_method: 'GET',
+          http_headers_json: null,
+          http_body: null,
+          expected_status_json: null,
+          response_keyword: null,
+          response_keyword_mode: null,
+          response_forbidden_keyword: null,
+          response_forbidden_keyword_mode: null,
+          state_status: 'up',
+          state_last_error: null,
+          last_changed_at: 1_760_000_000,
+          consecutive_failures: 0,
+          consecutive_successes: 1,
+        },
+      ],
+    }) as unknown as Env;
+    env.ADMIN_TOKEN = 'test-admin-token';
+    env.SELF = {
+      fetch: vi.fn().mockResolvedValueOnce(
+        new Response(JSON.stringify({ ok: true, refreshed: false }), {
+          status: 200,
+          headers: {
+            'Content-Type': 'application/json; charset=utf-8',
+          },
+        }),
+      ),
+    } as unknown as Fetcher;
+    const waitUntil = vi.fn();
+
+    await runScheduledTick(env, { waitUntil } as unknown as ExecutionContext);
+    await Promise.all(waitUntil.mock.calls.map((call) => call[0] as Promise<unknown>));
+
+    expect(refreshPublicHomepageSnapshotIfNeeded).toHaveBeenCalledWith({
+      db: env.DB,
+      now: Math.floor(Date.now() / 1000),
+      compute: expect.any(Function),
+      seedDataSnapshot: true,
+    });
+  });
+
+  it('uses the current time when inline homepage refresh starts after a delayed service failure', async () => {
+    const env = createEnv({ dueRows: [] }) as unknown as Env;
+    env.ADMIN_TOKEN = 'test-admin-token';
+    const delayedTime = new Date('2026-02-17T00:02:42.000Z');
+    const delayedNow = Math.floor(delayedTime.valueOf() / 1000);
+    let rejectServiceFetch: ((reason?: unknown) => void) | null = null;
+    env.SELF = {
+      fetch: vi.fn(
+        async () =>
+          await new Promise<never>((_resolve, reject) => {
+            rejectServiceFetch = reject;
+          }),
+      ),
+    } as unknown as Fetcher;
+    const waitUntil = vi.fn();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    try {
+      await runScheduledTick(env, { waitUntil } as unknown as ExecutionContext);
+      vi.setSystemTime(delayedTime);
+      rejectServiceFetch?.(new Error('service refresh failed'));
+      await Promise.all(waitUntil.mock.calls.map((call) => call[0] as Promise<unknown>));
+
+      expect(refreshPublicHomepageSnapshotIfNeeded).toHaveBeenCalledWith({
+        db: env.DB,
+        now: delayedNow,
+        compute: expect.any(Function),
+        seedDataSnapshot: true,
+      });
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('uses the current wall clock when writing runtime snapshots after a delayed monitor batch', async () => {
+    let resolveCheck: ((value: unknown) => void) | null = null;
+
+    vi.mocked(runHttpCheck).mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveCheck = resolve;
+        }) as never,
+    );
+
+    const env = createEnv({
+      dueRows: [
+        {
+          id: 1,
+          name: 'API',
+          type: 'http',
+          target: 'https://example.com',
+          interval_sec: 60,
+          created_at: 1_760_000_000,
+          timeout_ms: 10_000,
+          http_method: 'GET',
+          http_headers_json: null,
+          http_body: null,
+          expected_status_json: null,
+          response_keyword: null,
+          response_keyword_mode: null,
+          response_forbidden_keyword: null,
+          response_forbidden_keyword_mode: null,
+          state_status: 'up',
+          state_last_error: null,
+          last_checked_at: 1_759_999_940,
+          last_changed_at: 1_759_999_940,
+          consecutive_failures: 0,
+          consecutive_successes: 1,
+        },
+      ],
+    });
+    const delayedTime = new Date('2026-02-17T00:02:42.000Z');
+    const delayedNow = Math.floor(delayedTime.valueOf() / 1000);
+    const waitUntil = vi.fn();
+    const tickPromise = runScheduledTick(env, { waitUntil } as unknown as ExecutionContext);
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(resolveCheck).toBeTypeOf('function');
+    vi.setSystemTime(delayedTime);
+    resolveCheck?.({
+      status: 'up',
+      latencyMs: 21,
+      httpStatus: 200,
+      error: null,
+      attempts: 1,
+    });
+    await tickPromise;
+
+    expect(refreshPublicMonitorRuntimeSnapshot).toHaveBeenCalledWith(
+      expect.objectContaining({
+        db: env.DB,
+        now: delayedNow,
+      }),
+    );
+  });
+
   it('logs inline homepage refresh fallback failures after a service refresh error', async () => {
     vi.mocked(refreshPublicHomepageSnapshotIfNeeded).mockRejectedValueOnce(
       new Error('inline refresh failed'),
@@ -710,6 +864,218 @@ describe('scheduler/scheduled regression', () => {
     } finally {
       warn.mockRestore();
     }
+  });
+
+  it('fails closed when the scheduler lease is lost before persistence', async () => {
+    let persistedWrites = 0;
+    let resolveCheck: ((value: unknown) => void) | null = null;
+
+    vi.mocked(runHttpCheck).mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveCheck = resolve;
+        }) as never,
+    );
+    vi.mocked(renewLease).mockResolvedValue(false);
+
+    const env = createEnv({
+      dueRows: [
+        {
+          id: 1,
+          name: 'API',
+          type: 'http',
+          target: 'https://example.com',
+          interval_sec: 60,
+          created_at: 1_760_000_000,
+          timeout_ms: 10_000,
+          http_method: 'GET',
+          http_headers_json: null,
+          http_body: null,
+          expected_status_json: null,
+          response_keyword: null,
+          response_keyword_mode: null,
+          response_forbidden_keyword: null,
+          response_forbidden_keyword_mode: null,
+          state_status: 'up',
+          state_last_error: null,
+          last_checked_at: 1_759_999_940,
+          last_changed_at: 1_759_999_940,
+          consecutive_failures: 0,
+          consecutive_successes: 1,
+        },
+      ],
+      onRun: () => {
+        persistedWrites += 1;
+      },
+    });
+
+    const waitUntil = vi.fn();
+    const tickPromise = runScheduledTick(env, { waitUntil } as unknown as ExecutionContext);
+
+    await vi.advanceTimersByTimeAsync(90_000);
+    resolveCheck?.({
+      status: 'up',
+      latencyMs: 21,
+      httpStatus: 200,
+      error: null,
+      attempts: 1,
+    });
+    await tickPromise;
+
+    expect(persistedWrites).toBe(0);
+    expect(waitUntil).not.toHaveBeenCalled();
+  });
+
+  it('renews claimed monitor execution leases during long-running batches', async () => {
+    let resolveCheck: ((value: unknown) => void) | null = null;
+
+    vi.mocked(runHttpCheck).mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveCheck = resolve;
+        }) as never,
+    );
+
+    const env = createEnv({
+      dueRows: [
+        {
+          id: 1,
+          name: 'API 1',
+          type: 'http',
+          target: 'https://example.com/1',
+          interval_sec: 60,
+          created_at: 1_760_000_001,
+          timeout_ms: 10_000,
+          http_method: 'GET',
+          http_headers_json: null,
+          http_body: null,
+          expected_status_json: null,
+          response_keyword: null,
+          response_keyword_mode: null,
+          response_forbidden_keyword: null,
+          response_forbidden_keyword_mode: null,
+          state_status: 'up',
+          state_last_error: null,
+          last_checked_at: 1_759_999_940,
+          last_changed_at: 1_759_999_940,
+          consecutive_failures: 0,
+          consecutive_successes: 1,
+        },
+      ],
+    });
+    const checkedAt = Math.floor(Math.floor(Date.now() / 1000) / 60) * 60;
+
+    const batchPromise = runExclusivePersistedMonitorBatch({
+      db: env.DB,
+      ids: [1],
+      checkedAt,
+      stateMachineConfig: {
+        failuresToDownFromUp: 2,
+        successesToUpFromDown: 2,
+      },
+    });
+
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    expect(renewLease).toHaveBeenCalledWith(
+      env.DB,
+      `scheduler:batch-monitor:${checkedAt}:1`,
+      expect.any(Number),
+      expect.any(Number),
+    );
+
+    resolveCheck?.({
+      status: 'up',
+      latencyMs: 21,
+      httpStatus: 200,
+      error: null,
+      attempts: 1,
+    });
+    await batchPromise;
+  });
+
+  it('skips monitor ids already claimed by an overlapping batch execution', async () => {
+    const checkedAt = Math.floor(Math.floor(Date.now() / 1000) / 60) * 60;
+    const env = createEnv({
+      dueRows: [
+        {
+          id: 1,
+          name: 'API 1',
+          type: 'http',
+          target: 'https://example.com/1',
+          interval_sec: 60,
+          created_at: 1_760_000_001,
+          timeout_ms: 10_000,
+          http_method: 'GET',
+          http_headers_json: null,
+          http_body: null,
+          expected_status_json: null,
+          response_keyword: null,
+          response_keyword_mode: null,
+          response_forbidden_keyword: null,
+          response_forbidden_keyword_mode: null,
+          state_status: 'up',
+          state_last_error: null,
+          last_checked_at: checkedAt - 60,
+          last_changed_at: 1_760_000_000,
+          consecutive_failures: 0,
+          consecutive_successes: 1,
+        },
+        {
+          id: 2,
+          name: 'API 2',
+          type: 'http',
+          target: 'https://example.com/2',
+          interval_sec: 60,
+          created_at: 1_760_000_002,
+          timeout_ms: 10_000,
+          http_method: 'GET',
+          http_headers_json: null,
+          http_body: null,
+          expected_status_json: null,
+          response_keyword: null,
+          response_keyword_mode: null,
+          response_forbidden_keyword: null,
+          response_forbidden_keyword_mode: null,
+          state_status: 'up',
+          state_last_error: null,
+          last_checked_at: checkedAt - 60,
+          last_changed_at: 1_760_000_000,
+          consecutive_failures: 0,
+          consecutive_successes: 1,
+        },
+      ],
+    });
+
+    vi.mocked(acquireLease).mockImplementation(async (_db, name) => {
+      if (name === `scheduler:batch-monitor:${checkedAt}:1`) {
+        return false;
+      }
+      return true;
+    });
+
+    const result = await runExclusivePersistedMonitorBatch({
+      db: env.DB,
+      ids: [1, 2],
+      checkedAt,
+      stateMachineConfig: {
+        failuresToDownFromUp: 2,
+        successesToUpFromDown: 2,
+      },
+    });
+
+    expect(runHttpCheck).toHaveBeenCalledTimes(1);
+    expect(runHttpCheck).toHaveBeenCalledWith(
+      expect.objectContaining({
+        url: 'https://example.com/2',
+      }),
+    );
+    expect(result.runtimeUpdates).toMatchObject([
+      {
+        monitor_id: 2,
+      },
+    ]);
+    expect(result.stats.rejectedCount).toBe(1);
   });
 
   it('keeps inline notifications when a service batch falls back with active channels', async () => {

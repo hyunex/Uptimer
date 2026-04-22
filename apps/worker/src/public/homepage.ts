@@ -24,7 +24,7 @@ import {
   computeTodayPartialUptimeBatch,
   listIncidentMonitorIdsByIncidentId,
   listMaintenanceWindowMonitorIdsByWindowId,
-  listVisibleActiveIncidents,
+  readVisibleActiveIncidentSummary,
   listVisibleMaintenanceWindows,
   readPublicSiteSettings,
   toIncidentImpact,
@@ -379,20 +379,6 @@ function toMaintenancePreview(row: MaintenanceWindowRow, monitorIds: number[]): 
   };
 }
 
-function collectMaintenanceMonitorIds(
-  windows: Array<{ monitorIds: number[] }>,
-): ReadonlySet<number> {
-  const monitorIds = new Set<number>();
-  for (const window of windows) {
-    for (const monitorId of window.monitorIds) {
-      if (typeof monitorId === 'number') {
-        monitorIds.add(monitorId);
-      }
-    }
-  }
-  return monitorIds;
-}
-
 function maintenancePreviewFromStatusWindow(
   window: PublicStatusResponse['maintenance_windows']['active'][number],
 ): MaintenancePreview {
@@ -611,6 +597,9 @@ function canReuseBaseSnapshotMonitorMetadata(opts: {
   ) {
     return false;
   }
+  if (runtimeSnapshot.generated_at < baseSnapshot.generated_at) {
+    return false;
+  }
 
   const monitorIds = getHomepageSnapshotMonitorIds(baseSnapshot);
   if (!snapshotHasMonitorIds(runtimeSnapshot, monitorIds)) {
@@ -619,7 +608,7 @@ function canReuseBaseSnapshotMonitorMetadata(opts: {
 
   const runtimeById = toMonitorRuntimeEntryMap(runtimeSnapshot);
   return baseSnapshot.monitors.every((monitor) =>
-    hasReusableRuntimeCreatedAt(runtimeById.get(monitor.id)),
+    isRuntimeEntryReusableForBaseMonitor(monitor, runtimeById.get(monitor.id)),
   );
 }
 
@@ -634,6 +623,7 @@ function canTrustBaseSnapshotMonitorMetadata(opts: {
 
   if (
     baseSnapshot.monitor_count_total !== baseSnapshot.monitors.length ||
+    runtimeSnapshot.generated_at < baseSnapshot.generated_at ||
     !snapshotHasMonitorIds(
       runtimeSnapshot,
       getHomepageSnapshotMonitorIds(baseSnapshot),
@@ -644,8 +634,32 @@ function canTrustBaseSnapshotMonitorMetadata(opts: {
 
   const runtimeById = toMonitorRuntimeEntryMap(runtimeSnapshot);
   return baseSnapshot.monitors.every((monitor) =>
-    hasReusableRuntimeCreatedAt(runtimeById.get(monitor.id)),
+    isRuntimeEntryReusableForBaseMonitor(monitor, runtimeById.get(monitor.id)),
   );
+}
+
+function isRuntimeEntryReusableForBaseMonitor(
+  monitor: HomepageMonitorCard,
+  entry: PublicMonitorRuntimeEntry | undefined,
+): entry is PublicMonitorRuntimeEntry & { created_at: number } {
+  if (!hasReusableRuntimeCreatedAt(entry)) {
+    return false;
+  }
+  if (
+    monitor.last_checked_at !== null &&
+    (entry.last_checked_at === null || entry.last_checked_at < monitor.last_checked_at)
+  ) {
+    return false;
+  }
+  if (
+    monitor.last_checked_at !== null &&
+    entry.last_checked_at === monitor.last_checked_at &&
+    !monitor.is_stale &&
+    fromRuntimeStatusCode(entry.last_status_code) !== monitor.status
+  ) {
+    return false;
+  }
+  return true;
 }
 
 function buildHomepageMonitorRowsFromBaseSnapshot(
@@ -1287,7 +1301,7 @@ async function findLatestVisibleResolvedIncident(
   includeHiddenMonitors: boolean,
 ): Promise<IncidentRow | null> {
   const incidentVisibilitySql = incidentStatusPageVisibilityPredicate(includeHiddenMonitors);
-  let cursor: number | null = null;
+  let cursor: { resolvedAt: number; id: number } | null = null;
 
   while (true) {
     const queryResult: { results: IncidentRow[] | undefined } = cursor
@@ -1297,13 +1311,14 @@ async function findLatestVisibleResolvedIncident(
             SELECT id, title, status, impact, message, started_at, resolved_at
             FROM incidents
             WHERE status = 'resolved'
+              AND resolved_at IS NOT NULL
               AND ${incidentVisibilitySql}
-              AND id < ?2
-            ORDER BY id DESC
+              AND (resolved_at < ?2 OR (resolved_at = ?2 AND id < ?3))
+            ORDER BY resolved_at DESC, id DESC
             LIMIT ?1
           `,
           )
-          .bind(PREVIEW_BATCH_LIMIT, cursor)
+          .bind(PREVIEW_BATCH_LIMIT, cursor.resolvedAt, cursor.id)
           .all<IncidentRow>()
       : await db
           .prepare(
@@ -1311,8 +1326,9 @@ async function findLatestVisibleResolvedIncident(
             SELECT id, title, status, impact, message, started_at, resolved_at
             FROM incidents
             WHERE status = 'resolved'
+              AND resolved_at IS NOT NULL
               AND ${incidentVisibilitySql}
-            ORDER BY id DESC
+            ORDER BY resolved_at DESC, id DESC
             LIMIT ?1
           `,
           )
@@ -1347,7 +1363,14 @@ async function findLatestVisibleResolvedIncident(
       return null;
     }
 
-    cursor = rows[rows.length - 1]?.id ?? null;
+    const nextCursor = rows[rows.length - 1];
+    if (nextCursor?.resolved_at === null || nextCursor?.resolved_at === undefined) {
+      return null;
+    }
+    cursor = {
+      resolvedAt: nextCursor.resolved_at,
+      id: nextCursor.id,
+    };
   }
 }
 
@@ -1358,7 +1381,7 @@ async function findLatestVisibleHistoricalMaintenanceWindow(
 ): Promise<{ row: MaintenanceWindowRow; monitorIds: number[] } | null> {
   const maintenanceVisibilitySql =
     maintenanceWindowStatusPageVisibilityPredicate(includeHiddenMonitors);
-  let cursor: number | null = null;
+  let cursor: { endsAt: number; id: number } | null = null;
 
   while (true) {
     const queryResult: { results: MaintenanceWindowRow[] | undefined } = cursor
@@ -1369,12 +1392,12 @@ async function findLatestVisibleHistoricalMaintenanceWindow(
             FROM maintenance_windows
             WHERE ends_at <= ?1
               AND ${maintenanceVisibilitySql}
-              AND id < ?3
-            ORDER BY id DESC
-            LIMIT ?2
+              AND (ends_at < ?2 OR (ends_at = ?2 AND id < ?3))
+            ORDER BY ends_at DESC, id DESC
+            LIMIT ?4
           `,
           )
-          .bind(now, PREVIEW_BATCH_LIMIT, cursor)
+          .bind(now, cursor.endsAt, cursor.id, PREVIEW_BATCH_LIMIT)
           .all<MaintenanceWindowRow>()
       : await db
           .prepare(
@@ -1383,7 +1406,7 @@ async function findLatestVisibleHistoricalMaintenanceWindow(
             FROM maintenance_windows
             WHERE ends_at <= ?1
               AND ${maintenanceVisibilitySql}
-            ORDER BY id DESC
+            ORDER BY ends_at DESC, id DESC
             LIMIT ?2
           `,
           )
@@ -1418,7 +1441,14 @@ async function findLatestVisibleHistoricalMaintenanceWindow(
       return null;
     }
 
-    cursor = rows[rows.length - 1]?.id ?? null;
+    const nextCursor = rows[rows.length - 1];
+    if (!nextCursor) {
+      return null;
+    }
+    cursor = {
+      endsAt: nextCursor.ends_at,
+      id: nextCursor.id,
+    };
   }
 }
 
@@ -1625,6 +1655,10 @@ function computePatchedHomepageUptimeDayContribution(opts: {
   };
 }
 
+function isFastPatchUpdateFresh(now: number, update: MonitorRuntimeUpdate): boolean {
+  return now - update.checked_at <= update.interval_sec * 2;
+}
+
 function tryPatchPublicHomepagePayloadFromRuntimeSnapshot(opts: {
   baseSnapshot: PublicHomepageResponse | null;
   runtimeSnapshot: PublicMonitorRuntimeSnapshot | null;
@@ -1682,6 +1716,10 @@ function tryPatchPublicHomepagePayloadFromRuntimeSnapshot(opts: {
     }
     if (update.checked_at > now) {
       opts.trace?.setLabel('runtime_snapshot_patch_skip', 'future_update');
+      return null;
+    }
+    if (!isFastPatchUpdateFresh(now, update)) {
+      opts.trace?.setLabel('runtime_snapshot_patch_skip', 'stale_update_age');
       return null;
     }
     if (updateById.has(update.monitor_id)) {
@@ -1751,10 +1789,28 @@ function tryPatchPublicHomepagePayloadFromRuntimeSnapshot(opts: {
         segmentStart,
         segmentEnd,
       });
+      const nextPresentation = computeHomepageMonitorPresentation(
+        {
+          id: baseMonitor.id,
+          interval_sec: intervalSec,
+          last_checked_at: update.checked_at,
+          state_status: update.next_status,
+        },
+        now,
+        noMaintenanceMonitorIds,
+      );
+      const tail = computePatchedHomepageSegmentTotals({
+        status: nextPresentation.status,
+        isStale: nextPresentation.is_stale,
+        lastCheckedAt: update.checked_at,
+        intervalSec,
+        segmentStart: Math.max(segmentEnd, update.checked_at),
+        segmentEnd: now,
+      });
 
       const totalSec = Math.max(0, now - Math.max(todayStartAt, createdAt));
-      const nextDowntimeSec = currentDowntime + segment.downtimeSec;
-      const nextUnknownSec = currentUnknown + segment.unknownSec;
+      const nextDowntimeSec = currentDowntime + segment.downtimeSec + tail.downtimeSec;
+      const nextUnknownSec = currentUnknown + segment.unknownSec + tail.unknownSec;
       const nextUptimeSec = Math.max(0, totalSec - nextDowntimeSec - nextUnknownSec);
       todayTotals = {
         total_sec: totalSec,
@@ -1767,8 +1823,8 @@ function tryPatchPublicHomepagePayloadFromRuntimeSnapshot(opts: {
       nextMonitor = {
         ...baseMonitor,
         last_checked_at: update.checked_at,
-        status: toMonitorStatus(update.next_status) ?? 'unknown',
-        is_stale: false,
+        status: nextPresentation.status,
+        is_stale: nextPresentation.is_stale,
         heartbeat_strip: {
           checked_at: [
             update.checked_at,
@@ -1909,6 +1965,9 @@ export function tryPatchPublicHomepagePayloadFromRuntimeUpdates(opts: {
     if (update.checked_at > now) {
       return null;
     }
+    if (!isFastPatchUpdateFresh(now, update)) {
+      return null;
+    }
     if (updateById.has(update.monitor_id)) {
       return null;
     }
@@ -1956,6 +2015,24 @@ export function tryPatchPublicHomepagePayloadFromRuntimeUpdates(opts: {
       intervalSec: update.interval_sec,
       segmentStart,
       segmentEnd,
+    });
+    const nextPresentation = computeHomepageMonitorPresentation(
+      {
+        id: monitor.id,
+        interval_sec: update.interval_sec,
+        last_checked_at: update.checked_at,
+        state_status: update.next_status,
+      },
+      now,
+      new Set<number>(),
+    );
+    const tail = computePatchedHomepageSegmentTotals({
+      status: nextPresentation.status,
+      isStale: nextPresentation.is_stale,
+      lastCheckedAt: update.checked_at,
+      intervalSec: update.interval_sec,
+      segmentStart: Math.max(segmentEnd, update.checked_at),
+      segmentEnd: now,
     });
 
     const nextCheckedAt = prependCappedArray(
@@ -2016,8 +2093,8 @@ export function tryPatchPublicHomepagePayloadFromRuntimeUpdates(opts: {
     const currentDowntime = Math.max(0, downtimeSec[bucketIndex] ?? 0);
     const currentUnknown = Math.max(0, unknownSec[bucketIndex] ?? 0);
     const totalSec = Math.max(0, now - Math.max(todayStartAt, update.created_at));
-    const nextDowntimeSec = currentDowntime + segment.downtimeSec;
-    const nextUnknownSec = currentUnknown + segment.unknownSec;
+    const nextDowntimeSec = currentDowntime + segment.downtimeSec + tail.downtimeSec;
+    const nextUnknownSec = currentUnknown + segment.unknownSec + tail.unknownSec;
     const nextUptimeSec = Math.max(0, totalSec - nextDowntimeSec - nextUnknownSec);
 
     downtimeSec[bucketIndex] = nextDowntimeSec;
@@ -2029,8 +2106,8 @@ export function tryPatchPublicHomepagePayloadFromRuntimeUpdates(opts: {
     const nextMonitor: HomepageMonitorCard = {
       ...monitor,
       last_checked_at: update.checked_at,
-      status: toMonitorStatus(update.next_status) ?? 'unknown',
-      is_stale: false,
+      status: nextPresentation.status,
+      is_stale: nextPresentation.is_stale,
       heartbeat_strip: {
         checked_at: nextCheckedAt,
         latency_ms: nextLatencyMs,
@@ -2396,7 +2473,7 @@ export async function computePublicHomepagePayload(
     async () => await listVisibleMaintenanceWindows(db, now, includeHiddenMonitors),
   );
 
-  const [settings, monitorData, activeIncidents, maintenanceWindows, historyPreviews] =
+  const [settings, monitorData, activeIncidentSummary, maintenanceWindows, historyPreviews] =
     await Promise.all([
       settingsPromise,
       withTraceAsync(
@@ -2406,8 +2483,8 @@ export async function computePublicHomepagePayload(
           await settingsPromise.then((resolvedSettings) =>
             buildHomepageMonitorData(db, now, includeHiddenMonitors, {
               uptimeRatingLevel: resolvedSettings.uptime_rating_level,
-              maintenanceMonitorIdsPromise: maintenanceWindowsPromise.then((resolvedMaintenance) =>
-                collectMaintenanceMonitorIds(resolvedMaintenance.active),
+              maintenanceMonitorIdsPromise: maintenanceWindowsPromise.then(
+                (resolvedMaintenance) => resolvedMaintenance.activeMonitorIds,
               ),
               baseSnapshot,
               ...(opts.monitorMetadataStamp !== undefined
@@ -2428,7 +2505,7 @@ export async function computePublicHomepagePayload(
       withTraceAsync(
         trace,
         'homepage_active_incidents',
-        async () => await listVisibleActiveIncidents(db, includeHiddenMonitors),
+        async () => await readVisibleActiveIncidentSummary(db, includeHiddenMonitors),
       ),
       maintenanceWindowsPromise,
       withTraceAsync(
@@ -2438,6 +2515,7 @@ export async function computePublicHomepagePayload(
       ),
     ]);
 
+  const activeIncidents = activeIncidentSummary.items;
   const activeIncidentSummaries = withTraceSync(trace, 'homepage_present_incidents', () => {
     const summaries = new Array<IncidentSummary>(activeIncidents.length);
     for (let index = 0; index < activeIncidents.length; index += 1) {
@@ -2491,6 +2569,7 @@ export async function computePublicHomepagePayload(
       monitorCount: monitorData.monitors.length,
       activeIncidents,
       activeMaintenanceWindows: maintenanceWindows.active,
+      bannerIncident: activeIncidentSummary.bannerIncident,
     }),
     summary: monitorData.summary,
     monitors: monitorData.monitors,
@@ -2516,18 +2595,19 @@ export async function computePublicHomepageArtifactPayload(
     settings,
     summaryData,
     bootstrapRows,
-    activeIncidents,
+    activeIncidentSummary,
     maintenanceWindows,
     historyPreviews,
   ] = await Promise.all([
     settingsPromise,
     readHomepageMonitorSummary(db, now, includeHiddenMonitors),
     bootstrapRowsPromise,
-    listVisibleActiveIncidents(db, includeHiddenMonitors),
+    readVisibleActiveIncidentSummary(db, includeHiddenMonitors),
     maintenanceWindowsPromise,
     readHomepageHistoryPreviews(db, now),
   ]);
-  const maintenanceMonitorIds = collectMaintenanceMonitorIds(maintenanceWindows.active);
+  const maintenanceMonitorIds = maintenanceWindows.activeMonitorIds;
+  const activeIncidents = activeIncidentSummary.items;
   const monitors = await buildHomepageMonitorCardsFromRows(
     db,
     now,
@@ -2552,6 +2632,7 @@ export async function computePublicHomepageArtifactPayload(
       monitorCount: summaryData.monitorCountTotal,
       activeIncidents,
       activeMaintenanceWindows: maintenanceWindows.active,
+      bannerIncident: activeIncidentSummary.bannerIncident,
     }),
     summary: summaryData.summary,
     monitors,

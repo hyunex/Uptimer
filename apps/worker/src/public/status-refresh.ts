@@ -268,6 +268,10 @@ function computePatchedStatusSegmentTotals(opts: {
   };
 }
 
+function isFastPatchUpdateFresh(now: number, update: MonitorRuntimeUpdate): boolean {
+  return now - update.checked_at <= update.interval_sec * 2;
+}
+
 function prependCappedArray<T>(value: T, source: readonly T[], maxLength: number): T[] {
   const nextLength = Math.min(Math.max(1, maxLength), source.length + 1);
   const next = new Array<T>(nextLength);
@@ -366,7 +370,7 @@ function createStatusUptime30d(
   };
 }
 
-function tryPatchPublicStatusPayloadFromRuntimeUpdates(opts: {
+export function tryPatchPublicStatusPayloadFromRuntimeUpdates(opts: {
   baseSnapshot: PublicStatusResponse | null;
   now: number;
   updates: MonitorRuntimeUpdate[];
@@ -388,6 +392,9 @@ function tryPatchPublicStatusPayloadFromRuntimeUpdates(opts: {
       return null;
     }
     if (update.checked_at > now || updateById.has(update.monitor_id)) {
+      return null;
+    }
+    if (!isFastPatchUpdateFresh(now, update)) {
       return null;
     }
     updateById.set(update.monitor_id, update);
@@ -441,10 +448,24 @@ function tryPatchPublicStatusPayloadFromRuntimeUpdates(opts: {
       segmentStart,
       segmentEnd,
     });
+    const nextPresentation = computeStatusMonitorPresentation({
+      intervalSec: update.interval_sec,
+      lastCheckedAt: update.checked_at,
+      stateStatus: update.next_status,
+      now,
+    });
+    const tail = computePatchedStatusSegmentTotals({
+      status: nextPresentation.status,
+      isStale: nextPresentation.is_stale,
+      lastCheckedAt: update.checked_at,
+      intervalSec: update.interval_sec,
+      segmentStart: Math.max(segmentEnd, update.checked_at),
+      segmentEnd: now,
+    });
 
     const totalSec = Math.max(0, now - Math.max(todayStartAt, update.created_at));
-    const nextDowntimeSec = currentDowntime + segment.downtimeSec;
-    const nextUnknownSec = currentUnknown + segment.unknownSec;
+    const nextDowntimeSec = currentDowntime + segment.downtimeSec + tail.downtimeSec;
+    const nextUnknownSec = currentUnknown + segment.unknownSec + tail.unknownSec;
     const nextUptimeSec = Math.max(0, totalSec - nextDowntimeSec - nextUnknownSec);
     const today = buildTodayStatusUptimeDay(todayStartAt, {
       total_sec: totalSec,
@@ -462,8 +483,8 @@ function tryPatchPublicStatusPayloadFromRuntimeUpdates(opts: {
 
     const nextMonitor: StatusMonitor = {
       ...baseMonitor,
-      status: toMonitorStatus(update.next_status),
-      is_stale: false,
+      status: nextPresentation.status,
+      is_stale: nextPresentation.is_stale,
       last_checked_at: update.checked_at,
       last_latency_ms: normalizeRuntimeUpdateLatencyMs(update.latency_ms),
       heartbeats: prependCappedArray(

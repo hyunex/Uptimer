@@ -3,7 +3,7 @@ import { z } from 'zod';
 
 import type { Env } from '../env';
 import { hasValidAdminTokenRequest } from '../middleware/auth';
-import { AppError } from '../middleware/errors';
+import { AppError, handleError, handleNotFound } from '../middleware/errors';
 import { cachePublic } from '../middleware/cache-public';
 import {
   buildUnknownIntervals,
@@ -889,6 +889,8 @@ async function buildCompactLatencyResponseJson(opts: {
 }
 
 export const publicUiRoutes = new Hono<{ Bindings: Env }>();
+publicUiRoutes.onError(handleError);
+publicUiRoutes.notFound(handleNotFound);
 
 publicUiRoutes.use(
   '*',
@@ -1245,6 +1247,7 @@ publicUiRoutes.get('/monitors/:id/day-context', async (c) => {
 publicUiRoutes.get('/monitors/:id/outages', async (c) => {
   const includeHiddenMonitors = isAuthorizedStatusAdminRequest(c);
   const id = z.coerce.number().int().positive().parse(c.req.param('id'));
+  const range = z.enum(['30d']).optional().default('30d').parse(c.req.query('range'));
   const limit = z.coerce.number().int().min(1).max(200).optional().default(200).parse(c.req.query('limit'));
   const cursor = z.coerce.number().int().positive().optional().parse(c.req.query('cursor'));
 
@@ -1316,7 +1319,7 @@ publicUiRoutes.get('/monitors/:id/outages', async (c) => {
 
   return withVisibilityAwareCaching(
     c.json({
-      range: '30d',
+      range,
       range_start_at: rangeStart,
       range_end_at: rangeEnd,
       outages: page.map((row) => ({
@@ -1339,7 +1342,7 @@ publicUiRoutes.get('/monitors/:id/latency', async (c) => {
   const range = latencyRangeSchema.optional().default('24h').parse(c.req.query('range'));
   const format = c.req.query('format');
   if (format !== 'compact-v1') {
-    throw new AppError(404, 'NOT_FOUND', 'Latency route not found');
+    throw new AppError(400, 'INVALID_ARGUMENT', 'Unsupported latency format');
   }
 
   const monitor = await c.env.DB

@@ -4,15 +4,22 @@ import type { Env } from './env';
 import type { Trace } from './observability/trace';
 import {
   encodeMonitorRuntimeUpdatesCompact,
+  fromRuntimeStatusCode,
   parseMonitorRuntimeUpdates,
+  readPublicMonitorRuntimeSnapshot,
+  toMonitorRuntimeEntryMap,
   type MonitorRuntimeUpdate,
 } from './public/monitor-runtime';
 import type { CompletedDueMonitor } from './scheduler/scheduled';
+import { LeaseLostError, startRenewableLease } from './scheduler/lease-guard';
 
 const HOMEPAGE_REFRESH_LOCK_NAME = 'snapshot:homepage:refresh';
 const HOMEPAGE_REFRESH_LOCK_LEASE_SECONDS = 55;
+const HOMEPAGE_REFRESH_LOCK_RENEW_INTERVAL_MS = 15_000;
+const HOMEPAGE_REFRESH_LOCK_RENEW_MIN_REMAINING_SECONDS = 20;
 const INTERNAL_REQUEST_MAX_BYTES = 256 * 1024;
 const INTERNAL_PROTOCOL_FORMAT = 'compact-v1';
+const INTERNAL_BASELINE_QUERY_CHUNK_SIZE = 64;
 
 function normalizeTruthyHeader(value: string | null): boolean {
   if (!value) return false;
@@ -62,6 +69,187 @@ function isSameMinute(a: number, b: number): boolean {
   return Math.floor(a / 60) === Math.floor(b / 60);
 }
 
+function normalizeRuntimeUpdateStatus(
+  value: MonitorRuntimeUpdate['check_status'] | MonitorRuntimeUpdate['next_status'],
+): 'up' | 'down' | 'maintenance' | 'paused' | 'unknown' {
+  switch (value) {
+    case 'up':
+    case 'down':
+    case 'maintenance':
+    case 'paused':
+    case 'unknown':
+      return value;
+    default:
+      return 'unknown';
+  }
+}
+
+function readRuntimeUpdateCurrentStatus(
+  update: MonitorRuntimeUpdate,
+): 'up' | 'down' | 'maintenance' | 'paused' | 'unknown' {
+  return normalizeRuntimeUpdateStatus(update.next_status ?? update.check_status);
+}
+
+function readRuntimeUpdateHeartbeatStatus(
+  update: MonitorRuntimeUpdate,
+): 'up' | 'down' | 'maintenance' | 'paused' | 'unknown' {
+  return normalizeRuntimeUpdateStatus(update.check_status);
+}
+
+function buildNumberedPlaceholders(count: number, start = 1): string {
+  return Array.from({ length: count }, (_, index) => `?${index + start}`).join(', ');
+}
+
+async function readPersistedRuntimeUpdateBaseline(
+  db: D1Database,
+  updates: MonitorRuntimeUpdate[],
+): Promise<ReadonlyMap<number, { last_checked_at: number | null; status: string | null }> | null> {
+  const monitorIds = [...new Set(updates.map((update) => update.monitor_id))];
+  if (monitorIds.length === 0) {
+    return new Map();
+  }
+
+  const baseline = new Map<number, { last_checked_at: number | null; status: string | null }>();
+  try {
+    for (let index = 0; index < monitorIds.length; index += INTERNAL_BASELINE_QUERY_CHUNK_SIZE) {
+      const chunk = monitorIds.slice(index, index + INTERNAL_BASELINE_QUERY_CHUNK_SIZE);
+      const { results } = await db
+        .prepare(
+          `
+            SELECT monitor_id, last_checked_at, status
+            FROM monitor_state
+            WHERE monitor_id IN (${buildNumberedPlaceholders(chunk.length)})
+          `,
+        )
+        .bind(...chunk)
+        .all<{
+          monitor_id: number;
+          last_checked_at: number | null;
+          status: string | null;
+        }>();
+
+      for (const row of results ?? []) {
+        baseline.set(row.monitor_id, {
+          last_checked_at: row.last_checked_at,
+          status: row.status,
+        });
+      }
+    }
+
+    return baseline;
+  } catch {
+    return null;
+  }
+}
+
+async function sanitizeScheduledRuntimeUpdatesForFastPath(opts: {
+  db: D1Database;
+  now: number;
+  updates: MonitorRuntimeUpdate[];
+  trace?: Trace | null;
+}): Promise<MonitorRuntimeUpdate[]> {
+  if (opts.updates.length === 0) {
+    return opts.updates;
+  }
+
+  const runtimeSnapshot = await readPublicMonitorRuntimeSnapshot(opts.db, opts.now);
+  if (!runtimeSnapshot) {
+    const persistedBaseline = await readPersistedRuntimeUpdateBaseline(opts.db, opts.updates);
+    if (!persistedBaseline) {
+      opts.trace?.setLabel('runtime_updates_baseline', 'stale');
+      opts.trace?.setLabel('runtime_updates_stale_reason', 'baseline_unavailable');
+      return [];
+    }
+
+    for (const update of opts.updates) {
+      const persistedState = persistedBaseline.get(update.monitor_id);
+      if (!persistedState || persistedState.last_checked_at === null) {
+        continue;
+      }
+
+      if (update.checked_at < persistedState.last_checked_at) {
+        opts.trace?.setLabel('runtime_updates_baseline', 'stale');
+        opts.trace?.setLabel('runtime_updates_stale_monitor_id', update.monitor_id);
+        opts.trace?.setLabel('runtime_updates_stale_reason', 'checked_at_regressed');
+        return [];
+      }
+
+      if (
+        update.checked_at === persistedState.last_checked_at &&
+        normalizeRuntimeUpdateStatus(persistedState.status as MonitorRuntimeUpdate['next_status']) !==
+          readRuntimeUpdateCurrentStatus(update)
+      ) {
+        opts.trace?.setLabel('runtime_updates_baseline', 'stale');
+        opts.trace?.setLabel('runtime_updates_stale_monitor_id', update.monitor_id);
+        opts.trace?.setLabel('runtime_updates_stale_reason', 'state_mismatch');
+        return [];
+      }
+
+      if (update.checked_at === persistedState.last_checked_at) {
+        opts.trace?.setLabel('runtime_updates_baseline', 'stale');
+        opts.trace?.setLabel('runtime_updates_stale_monitor_id', update.monitor_id);
+        opts.trace?.setLabel('runtime_updates_stale_reason', 'heartbeat_unverified');
+        return [];
+      }
+    }
+
+    opts.trace?.setLabel('runtime_updates_baseline', 'persisted');
+    return opts.updates;
+  }
+
+  const runtimeById = toMonitorRuntimeEntryMap(runtimeSnapshot);
+  for (const update of opts.updates) {
+    const runtimeEntry = runtimeById.get(update.monitor_id);
+    if (!runtimeEntry || runtimeEntry.last_checked_at === null) {
+      continue;
+    }
+
+    if (update.checked_at < runtimeEntry.last_checked_at) {
+      opts.trace?.setLabel('runtime_updates_baseline', 'stale');
+      opts.trace?.setLabel('runtime_updates_stale_monitor_id', update.monitor_id);
+      opts.trace?.setLabel('runtime_updates_stale_reason', 'checked_at_regressed');
+      return [];
+    }
+
+    if (update.checked_at > runtimeEntry.last_checked_at) {
+      continue;
+    }
+
+    if (fromRuntimeStatusCode(runtimeEntry.last_status_code) !== readRuntimeUpdateCurrentStatus(update)) {
+      opts.trace?.setLabel('runtime_updates_baseline', 'stale');
+      opts.trace?.setLabel('runtime_updates_stale_monitor_id', update.monitor_id);
+      opts.trace?.setLabel('runtime_updates_stale_reason', 'state_mismatch');
+      return [];
+    }
+
+    const latestHeartbeatStatusCode = runtimeEntry.heartbeat_status_codes[0];
+    if (
+      latestHeartbeatStatusCode === 'u' ||
+      latestHeartbeatStatusCode === 'd' ||
+      latestHeartbeatStatusCode === 'm' ||
+      latestHeartbeatStatusCode === 'p' ||
+      latestHeartbeatStatusCode === 'x'
+    ) {
+      if (fromRuntimeStatusCode(latestHeartbeatStatusCode) !== readRuntimeUpdateHeartbeatStatus(update)) {
+        opts.trace?.setLabel('runtime_updates_baseline', 'stale');
+        opts.trace?.setLabel('runtime_updates_stale_monitor_id', update.monitor_id);
+        opts.trace?.setLabel('runtime_updates_stale_reason', 'heartbeat_mismatch');
+        return [];
+      }
+
+      if ((runtimeEntry.heartbeat_latency_ms[0] ?? null) !== update.latency_ms) {
+        opts.trace?.setLabel('runtime_updates_baseline', 'stale');
+        opts.trace?.setLabel('runtime_updates_stale_monitor_id', update.monitor_id);
+        opts.trace?.setLabel('runtime_updates_stale_reason', 'latency_mismatch');
+        return [];
+      }
+    }
+  }
+
+  opts.trace?.setLabel('runtime_updates_baseline', 'ok');
+  return opts.updates;
+}
+
 function buildInternalRefreshResponse(ok: boolean, refreshed: boolean): Response {
   return new Response(JSON.stringify({ ok, refreshed }), {
     status: ok ? 200 : 500,
@@ -70,6 +258,30 @@ function buildInternalRefreshResponse(ok: boolean, refreshed: boolean): Response
       'Cache-Control': 'no-store',
     },
   });
+}
+
+function buildNotFoundJsonResponse(origin: string | null): Response {
+  const headers = new Headers({
+    'Content-Type': 'application/json; charset=utf-8',
+    Vary: 'Origin',
+  });
+  if (origin) {
+    headers.set('Access-Control-Allow-Origin', origin);
+    headers.set('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+    headers.set('Access-Control-Allow-Headers', 'Authorization,Content-Type');
+  }
+  return new Response(
+    JSON.stringify({
+      error: {
+        code: 'NOT_FOUND',
+        message: 'Not Found',
+      },
+    }),
+    {
+      status: 404,
+      headers,
+    },
+  );
 }
 
 const internalRefreshJsonBodySchema = z.object({
@@ -200,11 +412,11 @@ function finalizeInternalRefreshResponse(
 }
 
 async function handleInternalHomepageRefresh(request: Request, env: Env): Promise<Response> {
+  if (!isInternalServiceRequest(request)) {
+    return buildNotFoundJsonResponse(request.headers.get('Origin'));
+  }
   if (request.method !== 'POST') {
     return new Response('Method Not Allowed', { status: 405 });
-  }
-  if (!isInternalServiceRequest(request)) {
-    return new Response('Not Found', { status: 404 });
   }
   if (!hasValidInternalAuth(request, env)) {
     return new Response('Forbidden', { status: 403 });
@@ -259,12 +471,25 @@ async function handleInternalHomepageRefresh(request: Request, env: Env): Promis
     trace.setLabel('now', now);
     trace.setLabel('runtime_updates_count', runtimeUpdates?.length ?? 0);
   }
+  const fastPathRuntimeUpdates =
+    scheduledRefreshRequest && runtimeUpdates
+      ? await sanitizeScheduledRuntimeUpdatesForFastPath({
+          db: env.DB,
+          now,
+          updates: runtimeUpdates,
+          trace,
+        })
+      : (runtimeUpdates ?? []);
+  if (trace?.enabled) {
+    trace.setLabel('runtime_updates_fast_path_count', fastPathRuntimeUpdates.length);
+  }
   const skipInitialFreshnessCheck = scheduledRefreshRequest;
   if (trace?.enabled && skipInitialFreshnessCheck) {
     trace.setLabel('skip_initial_freshness_check', '1');
   }
 
   let claimedLeaseExpiresAt: number | null = null;
+  let homepageRefreshLease: ReturnType<typeof startRenewableLease> | null = null;
   let releaseHomepageRefreshLease:
     | ((
         db: D1Database,
@@ -337,6 +562,15 @@ async function handleInternalHomepageRefresh(request: Request, env: Env): Promis
       );
     }
     claimedLeaseExpiresAt = now + HOMEPAGE_REFRESH_LOCK_LEASE_SECONDS;
+    homepageRefreshLease = startRenewableLease({
+      db: env.DB,
+      name: HOMEPAGE_REFRESH_LOCK_NAME,
+      leaseSeconds: HOMEPAGE_REFRESH_LOCK_LEASE_SECONDS,
+      initialExpiresAt: claimedLeaseExpiresAt,
+      renewIntervalMs: HOMEPAGE_REFRESH_LOCK_RENEW_INTERVAL_MS,
+      renewMinRemainingSeconds: HOMEPAGE_REFRESH_LOCK_RENEW_MIN_REMAINING_SECONDS,
+      logPrefix: 'internal refresh',
+    });
 
     const baseSnapshot = trace
       ? await trace.timeAsync(
@@ -351,7 +585,13 @@ async function handleInternalHomepageRefresh(request: Request, env: Env): Promis
         baseSnapshot.generatedAt === null ? 'none' : Math.max(0, now - baseSnapshot.generatedAt),
       );
     }
-    if (baseSnapshot.generatedAt !== null && isSameMinute(baseSnapshot.generatedAt, now)) {
+    const shouldHonorFreshAfterLeaseGate =
+      !(scheduledRefreshRequest && fastPathRuntimeUpdates.length > 0);
+    if (
+      shouldHonorFreshAfterLeaseGate &&
+      baseSnapshot.generatedAt !== null &&
+      isSameMinute(baseSnapshot.generatedAt, now)
+    ) {
       if (trace?.enabled) {
         trace.setLabel('skip', 'fresh_after_lease');
       }
@@ -420,7 +660,7 @@ async function handleInternalHomepageRefresh(request: Request, env: Env): Promis
                   now,
                   baseSnapshot: baseSnapshot.snapshot,
                   baseSnapshotBodyJson: null,
-                  updates: runtimeUpdates ?? [],
+                  updates: fastPathRuntimeUpdates,
                   trace,
                   onGuardState: (guardState) => {
                     statusFastGuardState = {
@@ -438,7 +678,7 @@ async function handleInternalHomepageRefresh(request: Request, env: Env): Promis
               now,
               baseSnapshot: baseSnapshot.snapshot,
               baseSnapshotBodyJson: null,
-              updates: runtimeUpdates ?? [],
+              updates: fastPathRuntimeUpdates,
               onGuardState: (guardState) => {
                 statusFastGuardState = {
                   settings: guardState.settings,
@@ -473,39 +713,55 @@ async function handleInternalHomepageRefresh(request: Request, env: Env): Promis
           });
       payload = computed;
     }
-    if (trace) {
-      await trace.timeAsync(
-        'homepage_refresh_write',
-        async () =>
-          await snapshotMod.writeHomepageSnapshot(
-            env.DB,
-            now,
-            payload,
-            trace,
-            baseSnapshot.seedDataSnapshot,
-          ),
-      );
-    } else {
-      await snapshotMod.writeHomepageSnapshot(
-        env.DB,
-        now,
-        payload,
-        undefined,
-        baseSnapshot.seedDataSnapshot,
+    payload = trace
+      ? trace.time('homepage_refresh_validate', () =>
+          snapshotMod.toHomepageSnapshotPayload(payload),
+        )
+      : snapshotMod.toHomepageSnapshotPayload(payload);
+    homepageRefreshLease.assertHeld('writing homepage snapshot');
+    const homepageSnapshotWritten = trace
+      ? await trace.timeAsync(
+          'homepage_refresh_write',
+          async () =>
+            await snapshotMod.writeHomepageSnapshot(
+              env.DB,
+              now,
+              payload,
+              trace,
+              baseSnapshot.seedDataSnapshot,
+            ),
+        )
+      : await snapshotMod.writeHomepageSnapshot(
+          env.DB,
+          now,
+          payload,
+          undefined,
+          baseSnapshot.seedDataSnapshot,
+        );
+    if (!homepageSnapshotWritten) {
+      if (trace?.enabled) {
+        trace.setLabel('skip', 'homepage_write_noop');
+      }
+      return finalizeInternalRefreshResponse(
+        buildInternalRefreshResponse(true, false),
+        trace,
+        traceMod,
+        { refreshed: false },
       );
     }
 
+    homepageRefreshLease.assertHeld('writing status snapshot');
     const statusRefreshArgs = statusFastGuardState
       ? {
           db: env.DB,
           now,
-          updates: runtimeUpdates ?? [],
+          updates: fastPathRuntimeUpdates,
           guardState: statusFastGuardState,
         }
       : {
           db: env.DB,
           now,
-          updates: runtimeUpdates ?? [],
+          updates: fastPathRuntimeUpdates,
         };
     const refreshedStatusPayload = trace
       ? await trace.timeAsync(
@@ -515,6 +771,7 @@ async function handleInternalHomepageRefresh(request: Request, env: Env): Promis
         )
       : await statusMod.tryComputePublicStatusPayloadFromScheduledRuntimeUpdates(statusRefreshArgs);
     if (refreshedStatusPayload) {
+      homepageRefreshLease.assertHeld('writing status snapshot');
       if (trace) {
         await trace.timeAsync(
           'status_refresh_write',
@@ -535,6 +792,19 @@ async function handleInternalHomepageRefresh(request: Request, env: Env): Promis
       { refreshed: true },
     );
   } catch (err) {
+    if (err instanceof LeaseLostError) {
+      console.warn(err.message);
+      if (trace?.enabled) {
+        trace.setLabel('skip', 'lease_lost');
+      }
+      return finalizeInternalRefreshResponse(
+        buildInternalRefreshResponse(true, false),
+        trace,
+        traceMod,
+        { refreshed: false },
+      );
+    }
+
     console.warn('internal refresh: homepage failed', err);
     return finalizeInternalRefreshResponse(
       buildInternalRefreshResponse(false, false),
@@ -543,11 +813,16 @@ async function handleInternalHomepageRefresh(request: Request, env: Env): Promis
       { error: true },
     );
   } finally {
+    if (homepageRefreshLease) {
+      await homepageRefreshLease.stop().catch((err) => {
+        console.warn('internal refresh: lease renewal task failed', err);
+      });
+    }
     if (claimedLeaseExpiresAt !== null && releaseHomepageRefreshLease) {
       await releaseHomepageRefreshLease(
         env.DB,
         HOMEPAGE_REFRESH_LOCK_NAME,
-        claimedLeaseExpiresAt,
+        homepageRefreshLease?.getExpiresAt() ?? claimedLeaseExpiresAt,
       ).catch((err) => {
         console.warn('internal refresh: failed to release homepage lease', err);
       });
@@ -560,11 +835,12 @@ async function handleInternalScheduledCheckBatch(
   env: Env,
   ctx: ExecutionContext,
 ): Promise<Response> {
+  const maxPastCheckedAtSkewSeconds = 5 * 60;
+  if (!isInternalServiceRequest(request)) {
+    return buildNotFoundJsonResponse(request.headers.get('Origin'));
+  }
   if (request.method !== 'POST') {
     return new Response('Method Not Allowed', { status: 405 });
-  }
-  if (!isInternalServiceRequest(request)) {
-    return new Response('Not Found', { status: 404 });
   }
   if (!hasValidInternalAuth(request, env)) {
     return new Response('Forbidden', { status: 403 });
@@ -581,7 +857,7 @@ async function handleInternalScheduledCheckBatch(
   const currentCheckedAt = Math.floor(now / 60) * 60;
   if (
     parsedBody.checked_at > currentCheckedAt ||
-    parsedBody.checked_at < currentCheckedAt - 60
+    parsedBody.checked_at < currentCheckedAt - maxPastCheckedAtSkewSeconds
   ) {
     return new Response('Forbidden', { status: 403 });
   }
@@ -599,22 +875,45 @@ async function handleInternalScheduledCheckBatch(
   const notify = notificationsModule
     ? await notificationsModule.createNotifyContext(env, ctx)
     : null;
-  const result = await runExclusivePersistedMonitorBatch({
-    db: env.DB,
-    ids,
-    checkedAt: parsedBody.checked_at,
-    suppressedMonitorIds,
-    stateMachineConfig: {
-      failuresToDownFromUp: parsedBody.state_failures_to_down_from_up,
-      successesToUpFromDown: parsedBody.state_successes_to_up_from_down,
-    },
-    ...(notificationsModule && notify
-      ? {
-          onPersistedMonitor: (completed: CompletedDueMonitor) =>
-            notificationsModule.queueMonitorNotification(env, notify, completed),
-        }
-      : {}),
-  });
+  let result;
+  try {
+    result = await runExclusivePersistedMonitorBatch({
+      db: env.DB,
+      ids,
+      checkedAt: parsedBody.checked_at,
+      abortSignal: request.signal,
+      suppressedMonitorIds,
+      stateMachineConfig: {
+        failuresToDownFromUp: parsedBody.state_failures_to_down_from_up,
+        successesToUpFromDown: parsedBody.state_successes_to_up_from_down,
+      },
+      ...(notificationsModule && notify
+        ? {
+            onPersistedMonitor: (completed: CompletedDueMonitor) =>
+              notificationsModule.queueMonitorNotification(env, notify, completed),
+          }
+        : {}),
+    });
+  } catch (err) {
+    if (err instanceof LeaseLostError) {
+      console.warn(err.message);
+      return new Response('Service Unavailable', {
+        status: 503,
+        headers: {
+          'Content-Type': 'text/plain; charset=utf-8',
+          'Cache-Control': 'no-store',
+        },
+      });
+    }
+    console.error('internal scheduled check batch failed', err);
+    return new Response('Internal Server Error', {
+      status: 500,
+      headers: {
+        'Content-Type': 'text/plain; charset=utf-8',
+        'Cache-Control': 'no-store',
+      },
+    });
+  }
 
   return new Response(
     JSON.stringify({

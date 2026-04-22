@@ -440,8 +440,8 @@ describe('public homepage route', () => {
     expect(bodyReads).toEqual(['homepage', 'homepage', 'homepage']);
   });
 
-  it('serves a slightly stale homepage snapshot via the worker hot path', async () => {
-    const payload = samplePayload(139);
+  it('serves a fresh homepage snapshot at the max-age boundary via the worker hot path', async () => {
+    const payload = samplePayload(140);
     let metadataReads = 0;
     const bodyReads: string[] = [];
     vi.spyOn(Date, 'now').mockReturnValue(200 * 1000);
@@ -549,6 +549,11 @@ describe('public homepage route', () => {
 
     expect(res.status).toBe(405);
     expect(res.headers.get('Allow')).toBe('GET, OPTIONS');
+    await expect(res.json()).resolves.toMatchObject({
+      error: {
+        code: 'METHOD_NOT_ALLOWED',
+      },
+    });
   });
 
   it('rejects non-GET methods on trailing-slash worker hot homepage endpoints', async () => {
@@ -561,6 +566,11 @@ describe('public homepage route', () => {
 
     expect(res.status).toBe(405);
     expect(res.headers.get('Allow')).toBe('GET, OPTIONS');
+    await expect(res.json()).resolves.toMatchObject({
+      error: {
+        code: 'METHOD_NOT_ALLOWED',
+      },
+    });
   });
 
   it('rejects non-GET methods on the worker hot homepage artifact endpoint', async () => {
@@ -573,6 +583,11 @@ describe('public homepage route', () => {
 
     expect(res.status).toBe(405);
     expect(res.headers.get('Allow')).toBe('GET, OPTIONS');
+    await expect(res.json()).resolves.toMatchObject({
+      error: {
+        code: 'METHOD_NOT_ALLOWED',
+      },
+    });
   });
 
   it('falls back to the fresh public status snapshot when the full homepage snapshot is missing', async () => {
@@ -676,6 +691,108 @@ describe('public homepage route', () => {
           },
         },
       ],
+    });
+  });
+
+  it('ignores future-dated homepage snapshot rows on the worker route and falls back to status composition', async () => {
+    const now = 200;
+    vi.spyOn(Date, 'now').mockReturnValue(now * 1000);
+
+    const res = await requestHomepage([
+      {
+        match: 'from public_snapshots',
+        first: (args) => {
+          if (args[0] === 'homepage') {
+            return {
+              generated_at: now + 600,
+              body_json: JSON.stringify(samplePayload(now + 600)),
+            };
+          }
+          if (args[0] === 'status') {
+            return {
+              generated_at: 190,
+              body_json: JSON.stringify({
+                generated_at: 190,
+                site_title: 'Status Hub',
+                site_description: 'Production services',
+                site_locale: 'en',
+                site_timezone: 'UTC',
+                uptime_rating_level: 4,
+                overall_status: 'up',
+                banner: {
+                  source: 'monitors',
+                  status: 'operational',
+                  title: 'All Systems Operational',
+                  down_ratio: null,
+                },
+                summary: {
+                  up: 1,
+                  down: 0,
+                  maintenance: 0,
+                  paused: 0,
+                  unknown: 0,
+                },
+                monitors: [
+                  {
+                    id: 1,
+                    name: 'API',
+                    type: 'http',
+                    group_name: null,
+                    group_sort_order: 0,
+                    sort_order: 0,
+                    uptime_rating_level: 4,
+                    status: 'up',
+                    is_stale: false,
+                    last_checked_at: 180,
+                    last_latency_ms: 42,
+                    heartbeats: [{ checked_at: 180, status: 'up', latency_ms: 42 }],
+                    uptime_30d: {
+                      range_start_at: 0,
+                      range_end_at: 190,
+                      total_sec: 190,
+                      downtime_sec: 0,
+                      unknown_sec: 0,
+                      uptime_sec: 190,
+                      uptime_pct: 100,
+                    },
+                    uptime_days: [
+                      {
+                        day_start_at: 0,
+                        total_sec: 190,
+                        downtime_sec: 0,
+                        unknown_sec: 0,
+                        uptime_sec: 190,
+                        uptime_pct: 100,
+                      },
+                    ],
+                  },
+                ],
+                active_incidents: [],
+                maintenance_windows: {
+                  active: [],
+                  upcoming: [],
+                },
+              }),
+            };
+          }
+          return null;
+        },
+      },
+      {
+        match: 'from incidents',
+        all: () => [],
+      },
+      {
+        match: 'from maintenance_windows',
+        all: () => [],
+      },
+    ]);
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toMatchObject({
+      generated_at: 190,
+      monitor_count_total: 1,
+      site_title: 'Status Hub',
     });
   });
 

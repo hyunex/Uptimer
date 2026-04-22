@@ -115,6 +115,11 @@ export type FilteredMaintenanceWindowEntry = {
   monitorIds: number[];
 };
 
+export type VisibleActiveIncidentSummary = {
+  items: FilteredIncidentEntry[];
+  bannerIncident: FilteredIncidentEntry | null;
+};
+
 export const STATUS_ACTIVE_INCIDENT_LIMIT = 5;
 export const STATUS_ACTIVE_MAINTENANCE_LIMIT = 3;
 export const STATUS_UPCOMING_MAINTENANCE_LIMIT = 5;
@@ -139,6 +144,98 @@ function appendMapValue<K, V>(map: Map<K, V[]>, key: K, value: V): void {
     return;
   }
   map.set(key, [value]);
+}
+
+function incidentImpactRank(
+  impact: PublicStatusResponse['active_incidents'][number]['impact'],
+): number {
+  switch (impact) {
+    case 'critical':
+      return 3;
+    case 'major':
+      return 2;
+    case 'minor':
+      return 1;
+    case 'none':
+    default:
+      return 0;
+  }
+}
+
+function chooseTopIncidentEntry(
+  entries: readonly FilteredIncidentEntry[],
+): FilteredIncidentEntry | null {
+  let best: FilteredIncidentEntry | null = null;
+
+  for (const entry of entries) {
+    if (!best) {
+      best = entry;
+      continue;
+    }
+
+    const candidateRank = incidentImpactRank(toIncidentImpact(entry.row.impact));
+    const bestRank = incidentImpactRank(toIncidentImpact(best.row.impact));
+    if (candidateRank > bestRank) {
+      best = entry;
+      continue;
+    }
+    if (candidateRank < bestRank) {
+      continue;
+    }
+
+    if (entry.row.started_at > best.row.started_at) {
+      best = entry;
+      continue;
+    }
+    if (entry.row.started_at === best.row.started_at && entry.row.id > best.row.id) {
+      best = entry;
+    }
+  }
+
+  return best;
+}
+
+async function mapVisibleIncidentEntries(
+  db: D1Database,
+  rows: IncidentRow[],
+  includeHiddenMonitors: boolean,
+): Promise<Map<number, FilteredIncidentEntry>> {
+  const byId = new Map<number, FilteredIncidentEntry>();
+  if (rows.length === 0) {
+    return byId;
+  }
+
+  const incidentMonitorIdsByIncidentId = await listIncidentMonitorIdsByIncidentId(
+    db,
+    rows.map((row) => row.id),
+  );
+
+  const statusPageVisibleMonitorIds = includeHiddenMonitors
+    ? new Set<number>()
+    : await listStatusPageVisibleMonitorIds(
+        db,
+        [...incidentMonitorIdsByIncidentId.values()].flat(),
+      );
+
+  for (const row of rows) {
+    const originalMonitorIds = incidentMonitorIdsByIncidentId.get(row.id) ?? [];
+    const visibleMonitorIds = filterStatusPageScopedMonitorIds(
+      originalMonitorIds,
+      statusPageVisibleMonitorIds,
+      includeHiddenMonitors,
+    );
+
+    if (!shouldIncludeStatusPageScopedItem(originalMonitorIds, visibleMonitorIds)) {
+      continue;
+    }
+
+    byId.set(row.id, {
+      row,
+      monitorIds: visibleMonitorIds,
+    });
+  }
+
+  return byId;
 }
 
 export function toMonitorStatus(value: string | null): MonitorStatus {
@@ -1141,6 +1238,13 @@ export async function listVisibleActiveIncidents(
   db: D1Database,
   includeHiddenMonitors: boolean,
 ): Promise<FilteredIncidentEntry[]> {
+  return (await readVisibleActiveIncidentSummary(db, includeHiddenMonitors)).items;
+}
+
+export async function readVisibleActiveIncidentSummary(
+  db: D1Database,
+  includeHiddenMonitors: boolean,
+): Promise<VisibleActiveIncidentSummary> {
   const incidentVisibilitySql = incidentStatusPageVisibilityPredicate(includeHiddenMonitors);
   const { results } = await db
     .prepare(
@@ -1157,38 +1261,46 @@ export async function listVisibleActiveIncidents(
     .all<IncidentRow>();
 
   const rows = results ?? [];
-  const incidentMonitorIdsByIncidentId = await listIncidentMonitorIdsByIncidentId(
+  let bannerRow: IncidentRow | null = null;
+  if (rows.length >= STATUS_ACTIVE_INCIDENT_LIMIT) {
+    bannerRow = await db
+      .prepare(
+        `
+        SELECT id, title, status, impact, message, started_at, resolved_at
+        FROM incidents
+        WHERE status != 'resolved'
+          AND ${incidentVisibilitySql}
+        ORDER BY
+          CASE impact
+            WHEN 'critical' THEN 3
+            WHEN 'major' THEN 2
+            WHEN 'minor' THEN 1
+            ELSE 0
+          END DESC,
+          started_at DESC,
+          id DESC
+        LIMIT 1
+      `,
+      )
+      .first<IncidentRow>();
+  }
+
+  const visibleEntriesById = await mapVisibleIncidentEntries(
     db,
-    rows.map((r) => r.id),
+    bannerRow && !rows.some((row) => row.id === bannerRow?.id) ? [...rows, bannerRow] : rows,
+    includeHiddenMonitors,
   );
-
-  const statusPageVisibleMonitorIds = includeHiddenMonitors
-    ? new Set<number>()
-    : await listStatusPageVisibleMonitorIds(
-        db,
-        [...incidentMonitorIdsByIncidentId.values()].flat(),
-      );
-
-  return rows
-    .map((row) => {
-      const originalMonitorIds = incidentMonitorIdsByIncidentId.get(row.id) ?? [];
-      const visibleMonitorIds = filterStatusPageScopedMonitorIds(
-        originalMonitorIds,
-        statusPageVisibleMonitorIds,
-        includeHiddenMonitors,
-      );
-
-      if (!shouldIncludeStatusPageScopedItem(originalMonitorIds, visibleMonitorIds)) {
-        return null;
-      }
-
-      return {
-        row,
-        monitorIds: visibleMonitorIds,
-      };
-    })
+  const items = rows
+    .map((row) => visibleEntriesById.get(row.id) ?? null)
     .filter((entry): entry is FilteredIncidentEntry => entry !== null)
     .slice(0, STATUS_ACTIVE_INCIDENT_LIMIT);
+
+  return {
+    items,
+    bannerIncident: bannerRow
+      ? (visibleEntriesById.get(bannerRow.id) ?? null)
+      : chooseTopIncidentEntry(items),
+  };
 }
 
 export async function listVisibleMaintenanceWindows(
@@ -1198,6 +1310,7 @@ export async function listVisibleMaintenanceWindows(
 ): Promise<{
   active: FilteredMaintenanceWindowEntry[];
   upcoming: FilteredMaintenanceWindowEntry[];
+  activeMonitorIds: ReadonlySet<number>;
 }> {
   const maintenanceVisibilitySql = maintenanceWindowStatusPageVisibilityPredicate(
     includeHiddenMonitors,
@@ -1295,7 +1408,41 @@ export async function listVisibleMaintenanceWindows(
     .filter((entry): entry is FilteredMaintenanceWindowEntry => entry !== null)
     .slice(0, STATUS_UPCOMING_MAINTENANCE_LIMIT);
 
-  return { active, upcoming };
+  const activeMonitorIds = new Set<number>();
+  if (activeRows.length >= STATUS_ACTIVE_MAINTENANCE_LIMIT) {
+    const { results: activeMonitorResults } = await db
+      .prepare(
+        `
+      SELECT DISTINCT mwm.monitor_id
+      FROM maintenance_windows mw
+      JOIN maintenance_window_monitors mwm ON mwm.maintenance_window_id = mw.id
+      WHERE mw.starts_at <= ?1 AND mw.ends_at > ?1
+        AND ${maintenanceWindowStatusPageVisibilityPredicate(includeHiddenMonitors, 'mw')}
+    `,
+      )
+      .bind(now)
+      .all<{ monitor_id: number }>();
+
+    for (const row of activeMonitorResults ?? []) {
+      if (
+        typeof row.monitor_id === 'number' &&
+        Number.isInteger(row.monitor_id) &&
+        row.monitor_id > 0
+      ) {
+        activeMonitorIds.add(row.monitor_id);
+      }
+    }
+  } else {
+    for (const monitorIds of activeWindowMonitorIdsByWindowId.values()) {
+      for (const monitorId of monitorIds) {
+        if (typeof monitorId === 'number' && Number.isInteger(monitorId) && monitorId > 0) {
+          activeMonitorIds.add(monitorId);
+        }
+      }
+    }
+  }
+
+  return { active, upcoming, activeMonitorIds };
 }
 
 export async function readPublicSiteSettings(
@@ -1310,27 +1457,12 @@ export function buildPublicStatusBanner(opts: {
   monitorCount: number;
   activeIncidents: FilteredIncidentEntry[];
   activeMaintenanceWindows: FilteredMaintenanceWindowEntry[];
+  bannerIncident?: FilteredIncidentEntry | null;
 }): Banner {
-  const { counts, monitorCount, activeIncidents, activeMaintenanceWindows } = opts;
-  const incidents = activeIncidents.map((entry) => entry.row);
-  if (incidents.length > 0) {
-    const impactRank = (impact: PublicStatusResponse['active_incidents'][number]['impact']) => {
-      switch (impact) {
-        case 'critical':
-          return 3;
-        case 'major':
-          return 2;
-        case 'minor':
-          return 1;
-        case 'none':
-        default:
-          return 0;
-      }
-    };
-
-    const maxImpact = incidents
-      .map((it) => toIncidentImpact(it.impact))
-      .reduce((acc, it) => (impactRank(it) > impactRank(acc) ? it : acc), 'none' as const);
+  const { counts, monitorCount, activeIncidents, activeMaintenanceWindows, bannerIncident } = opts;
+  const topIncident = bannerIncident?.row ?? chooseTopIncidentEntry(activeIncidents)?.row ?? null;
+  if (topIncident) {
+    const maxImpact = topIncident ? toIncidentImpact(topIncident.impact) : ('none' as const);
 
     const status: BannerStatus =
       maxImpact === 'critical' || maxImpact === 'major'
@@ -1346,17 +1478,16 @@ export function buildPublicStatusBanner(opts: {
           ? 'Partial Outage'
           : 'Incident';
 
-    const top = incidents[0];
     return {
       source: 'incident',
       status,
       title,
-      incident: top
+      incident: topIncident
         ? {
-            id: top.id,
-            title: top.title,
-            status: toIncidentStatus(top.status),
-            impact: toIncidentImpact(top.impact),
+            id: topIncident.id,
+            title: topIncident.title,
+            status: toIncidentStatus(topIncident.status),
+            impact: toIncidentImpact(topIncident.impact),
           }
         : null,
     };

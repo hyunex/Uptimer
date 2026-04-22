@@ -16,6 +16,7 @@ import {
   filterStatusPageScopedMonitorIds,
   incidentStatusPageVisibilityPredicate,
   listStatusPageVisibleMonitorIds,
+  maintenanceWindowStatusPageVisibilityPredicate,
   monitorVisibilityPredicate,
   shouldIncludeStatusPageScopedItem,
 } from '../public/visibility';
@@ -33,7 +34,7 @@ import {
   writeStatusSnapshot,
 } from '../snapshots';
 
-import { AppError } from '../middleware/errors';
+import { AppError, handleError, handleNotFound } from '../middleware/errors';
 import { cachePublic } from '../middleware/cache-public';
 import { Trace, applyTraceToResponse, resolveTraceOptions } from '../observability/trace';
 
@@ -42,13 +43,19 @@ type PublicStatusSnapshotRow = {
   body_json: string;
 };
 
-const HOMEPAGE_UNKNOWN_DOWNGRADE_GUARD_SECONDS = 2 * 60;
-
 function safeJsonParse(text: string): unknown | null {
   const trimmed = text.trim();
   if (!trimmed) return null;
   try {
     return JSON.parse(trimmed) as unknown;
+  } catch {
+    return null;
+  }
+}
+
+function safeToSnapshotPayload(data: unknown) {
+  try {
+    return toSnapshotPayload(data);
   } catch {
     return null;
   }
@@ -82,52 +89,6 @@ function withVisibilityAwareCaching(res: Response, includeHiddenMonitors: boolea
   return includeHiddenMonitors ? applyPrivateNoStore(res) : appendAuthorizationVary(res);
 }
 
-function shouldPreferRecentHomepageArtifact(opts: {
-  artifact:
-    | {
-        age: number;
-        data: {
-          snapshot: {
-            overall_status: string;
-            banner: { status: string };
-            summary: { unknown: number };
-          };
-        };
-      }
-    | null;
-  computed: {
-    overall_status: string;
-    banner: { status: string };
-    summary: { unknown: number };
-  };
-}): boolean {
-  const { artifact, computed } = opts;
-  if (!artifact) return false;
-
-  const snapshot = artifact.data.snapshot;
-  if (artifact.age > HOMEPAGE_UNKNOWN_DOWNGRADE_GUARD_SECONDS) {
-    return false;
-  }
-
-  const computedShowsUnknownLead =
-    computed.overall_status === 'unknown' || computed.banner.status === 'unknown';
-  if (!computedShowsUnknownLead) {
-    return false;
-  }
-
-  const artifactShowsKnownLead =
-    snapshot.overall_status !== 'unknown' || snapshot.banner.status !== 'unknown';
-  if (!artifactShowsKnownLead) {
-    return false;
-  }
-
-  return (
-    computed.summary.unknown > snapshot.summary.unknown ||
-    computed.overall_status !== snapshot.overall_status ||
-    computed.banner.status !== snapshot.banner.status
-  );
-}
-
 async function readStaleStatusSnapshot(
   db: D1Database,
   now: number,
@@ -145,6 +106,7 @@ async function readStaleStatusSnapshot(
       .first<PublicStatusSnapshotRow>();
 
     if (!row) return null;
+    if (row.generated_at > now + 60) return null;
 
     const age = Math.max(0, now - row.generated_at);
     if (age > maxStaleSeconds) return null;
@@ -159,6 +121,8 @@ async function readStaleStatusSnapshot(
 }
 
 export const publicRoutes = new Hono<{ Bindings: Env }>();
+publicRoutes.onError(handleError);
+publicRoutes.notFound(handleNotFound);
 
 // Cache public endpoints at the edge to improve performance on slow networks.
 publicRoutes.use(
@@ -377,6 +341,11 @@ type IncidentMonitorLinkRow = {
   monitor_id: number;
 };
 
+type ResolvedIncidentCursorRow = {
+  id: number;
+  resolved_at: number | null;
+};
+
 function toIncidentStatus(
   value: string | null,
 ): 'investigating' | 'identified' | 'monitoring' | 'resolved' {
@@ -501,6 +470,11 @@ type MaintenanceWindowRow = {
 type MaintenanceWindowMonitorLinkRow = {
   maintenance_window_id: number;
   monitor_id: number;
+};
+
+type MaintenanceHistoryCursorRow = {
+  id: number;
+  ends_at: number;
 };
 
 function maintenanceWindowRowToApi(row: MaintenanceWindowRow, monitorIds: number[] = []) {
@@ -790,7 +764,33 @@ async function listPublicMaintenanceWindowsPage(opts: {
 }> {
   const limitPlusOne = opts.limit + 1;
   const batchLimit = Math.max(50, limitPlusOne);
-  let seekCursor = opts.cursor;
+  const maintenanceCursorVisibilitySql = maintenanceWindowStatusPageVisibilityPredicate(
+    opts.includeHiddenMonitors,
+  );
+  let seekCursor: MaintenanceHistoryCursorRow | null = null;
+  if (opts.cursor !== undefined) {
+    const cursorRow = await opts.db
+      .prepare(
+        `
+          SELECT id, ends_at
+          FROM maintenance_windows
+          WHERE id = ?1
+            AND ends_at <= ?2
+            AND ${maintenanceCursorVisibilitySql}
+        `,
+      )
+      .bind(opts.cursor, opts.now)
+      .first<MaintenanceHistoryCursorRow>();
+
+    if (!cursorRow || typeof cursorRow.ends_at !== 'number') {
+      return {
+        maintenance_windows: [],
+        next_cursor: null,
+      };
+    }
+
+    seekCursor = cursorRow;
+  }
   const collected: Array<{ row: MaintenanceWindowRow; monitorIds: number[] }> = [];
 
   while (collected.length < limitPlusOne) {
@@ -801,12 +801,12 @@ async function listPublicMaintenanceWindowsPage(opts: {
               SELECT id, title, message, starts_at, ends_at, created_at
               FROM maintenance_windows
               WHERE ends_at <= ?1
-                AND id < ?3
-              ORDER BY id DESC
+                AND (ends_at < ?3 OR (ends_at = ?3 AND id < ?4))
+              ORDER BY ends_at DESC, id DESC
               LIMIT ?2
             `,
           )
-          .bind(opts.now, batchLimit, seekCursor)
+          .bind(opts.now, batchLimit, seekCursor.ends_at, seekCursor.id)
           .all<MaintenanceWindowRow>()
       : await opts.db
           .prepare(
@@ -814,7 +814,7 @@ async function listPublicMaintenanceWindowsPage(opts: {
               SELECT id, title, message, starts_at, ends_at, created_at
               FROM maintenance_windows
               WHERE ends_at <= ?1
-              ORDER BY id DESC
+              ORDER BY ends_at DESC, id DESC
               LIMIT ?2
             `,
           )
@@ -856,7 +856,10 @@ async function listPublicMaintenanceWindowsPage(opts: {
     if (allWindows.length < batchLimit || !lastRow) {
       break;
     }
-    seekCursor = lastRow.id;
+    seekCursor = {
+      id: lastRow.id,
+      ends_at: lastRow.ends_at,
+    };
   }
 
   const maintenanceWindows = collected
@@ -934,16 +937,16 @@ publicRoutes.get('/status', async (c) => {
     // instead of failing the entire status page.
     const stale = await readStaleStatusSnapshot(c.env.DB, now, 10 * 60);
     if (stale) {
-      const res = withVisibilityAwareCaching(
-        c.json(toSnapshotPayload(stale.data)),
-        includeHiddenMonitors,
-      );
-      applyStatusCacheHeaders(res, Math.min(60, stale.age));
-      trace.setLabel('path', 'stale');
-      trace.setLabel('age', stale.age);
-      trace.finish('total');
-      applyTraceToResponse({ res, trace, prefix: 'w' });
-      return res;
+      const payload = safeToSnapshotPayload(stale.data);
+      if (payload) {
+        const res = withVisibilityAwareCaching(c.json(payload), includeHiddenMonitors);
+        applyStatusCacheHeaders(res, Math.min(60, stale.age));
+        trace.setLabel('path', 'stale');
+        trace.setLabel('age', stale.age);
+        trace.finish('total');
+        applyTraceToResponse({ res, trace, prefix: 'w' });
+        return res;
+      }
     }
 
     throw err;
@@ -997,29 +1000,10 @@ publicRoutes.get('/homepage', async (c) => {
     return res;
   }
 
-  const artifactSnapshotPromise = trace.timeAsync('homepage_artifact_stale_read', () =>
-    readStaleHomepageSnapshotArtifact(c.env.DB, now),
-  );
-
   try {
     const statusPayload = await trace.timeAsync('status_compute', () =>
       computePublicStatusPayload(c.env.DB, now),
     );
-    const artifactSnapshot = await trace.timeAsync('homepage_artifact_stale_wait', () =>
-      artifactSnapshotPromise,
-    );
-    if (
-      artifactSnapshot &&
-      shouldPreferRecentHomepageArtifact({ artifact: artifactSnapshot, computed: statusPayload })
-    ) {
-      const res = c.json(artifactSnapshot.data.snapshot);
-      applyHomepageCacheHeaders(res, Math.min(60, artifactSnapshot.age));
-      trace.setLabel('path', 'artifact_prefer');
-      trace.setLabel('age', artifactSnapshot.age);
-      trace.finish('total');
-      applyTraceToResponse({ res, trace, prefix: 'w' });
-      return res;
-    }
 
     const previews = await trace.timeAsync('homepage_previews', () => historyPreviewsPromise);
     const payload = trace.time('homepage_compose', () =>
@@ -1058,9 +1042,10 @@ publicRoutes.get('/homepage', async (c) => {
       readStaleStatusSnapshot(c.env.DB, now, 10 * 60),
     );
     if (staleStatus) {
-      try {
+      const staleStatusPayload = safeToSnapshotPayload(staleStatus.data);
+      if (staleStatusPayload) {
         const payload = homepageFromStatusPayload(
-          toSnapshotPayload(staleStatus.data),
+          staleStatusPayload,
           await historyPreviewsPromise.catch(() => ({
             resolvedIncidentPreview: null,
             maintenanceHistoryPreview: null,
@@ -1073,13 +1058,12 @@ publicRoutes.get('/homepage', async (c) => {
         trace.finish('total');
         applyTraceToResponse({ res, trace, prefix: 'w' });
         return res;
-      } catch (staleStatusErr) {
-        console.warn('public homepage: stale status snapshot invalid', staleStatusErr);
       }
+      console.warn('public homepage: stale status snapshot invalid');
     }
 
-    const staleArtifact = await trace.timeAsync('homepage_artifact_stale_wait', () =>
-      artifactSnapshotPromise,
+    const staleArtifact = await trace.timeAsync('homepage_artifact_stale_read', () =>
+      readStaleHomepageSnapshotArtifact(c.env.DB, now),
     );
     if (staleArtifact) {
       const res = c.json(staleArtifact.data.snapshot);
@@ -1188,44 +1172,73 @@ publicRoutes.get('/incidents', async (c) => {
       SELECT id, title, status, impact, message, started_at, resolved_at
       FROM incidents
       WHERE status = 'resolved'
+        AND resolved_at IS NOT NULL
         AND ${incidentVisibilitySql}
     `;
 
     const resolvedLimitPlusOne = remaining + 1;
     const batchLimit = Math.max(50, resolvedLimitPlusOne);
-    let seekCursor = cursor;
     const collected: IncidentRow[] = [];
+    const initialCursor =
+      cursor === undefined
+        ? null
+        : await c.env.DB
+            .prepare(
+              `
+                SELECT id, resolved_at
+                FROM incidents
+                WHERE id = ?1
+                  AND status = 'resolved'
+                  AND resolved_at IS NOT NULL
+                  AND ${incidentVisibilitySql}
+              `,
+            )
+            .bind(cursor)
+            .first<ResolvedIncidentCursorRow>();
 
-    while (collected.length < resolvedLimitPlusOne) {
-      const { results: resolvedRows } = seekCursor
-        ? await c.env.DB.prepare(
-            `
-              ${baseSql}
-                AND id < ?2
-              ORDER BY id DESC
-              LIMIT ?1
-            `,
-          )
-            .bind(batchLimit, seekCursor)
-            .all<IncidentRow>()
-        : await c.env.DB.prepare(
-            `
-              ${baseSql}
-              ORDER BY id DESC
-              LIMIT ?1
-            `,
-          )
-            .bind(batchLimit)
-            .all<IncidentRow>();
+    if (cursor === undefined || initialCursor) {
+      let seekCursor = initialCursor;
 
-      const allResolved = resolvedRows ?? [];
-      if (allResolved.length === 0) break;
+      while (collected.length < resolvedLimitPlusOne) {
+        const { results: resolvedRows } = seekCursor
+          ? await c.env.DB.prepare(
+              `
+                ${baseSql}
+                  AND (resolved_at < ?2 OR (resolved_at = ?2 AND id < ?3))
+                ORDER BY resolved_at DESC, id DESC
+                LIMIT ?1
+              `,
+            )
+              .bind(batchLimit, seekCursor.resolved_at, seekCursor.id)
+              .all<IncidentRow>()
+          : await c.env.DB.prepare(
+              `
+                ${baseSql}
+                ORDER BY resolved_at DESC, id DESC
+                LIMIT ?1
+              `,
+            )
+              .bind(batchLimit)
+              .all<IncidentRow>();
 
-      collected.push(...allResolved);
+        const allResolved = resolvedRows ?? [];
+        if (allResolved.length === 0) break;
 
-      const lastRow = allResolved[allResolved.length - 1];
-      if (allResolved.length < batchLimit || !lastRow) break;
-      seekCursor = lastRow.id;
+        collected.push(...allResolved);
+
+        const lastRow = allResolved[allResolved.length - 1];
+        if (
+          allResolved.length < batchLimit ||
+          !lastRow ||
+          typeof lastRow.resolved_at !== 'number'
+        ) {
+          break;
+        }
+        seekCursor = {
+          id: lastRow.id,
+          resolved_at: lastRow.resolved_at,
+        };
+      }
     }
 
     resolved = collected.slice(0, remaining);

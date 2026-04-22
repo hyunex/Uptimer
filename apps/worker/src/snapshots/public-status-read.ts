@@ -6,6 +6,7 @@ import { storedPublicStatusResponseSchema } from '../schemas/public-status-store
 const SNAPSHOT_KEY = 'status';
 const MAX_AGE_SECONDS = 60;
 const MAX_STALE_SECONDS = 10 * 60;
+const FUTURE_SNAPSHOT_TOLERANCE_SECONDS = 60;
 
 const READ_STATUS_SQL = `
   SELECT generated_at, updated_at, body_json
@@ -156,6 +157,7 @@ export async function readStatusSnapshotJson(
   try {
     const row = await readStatusSnapshotRow(db);
     if (!row) return null;
+    if (row.generated_at > now + FUTURE_SNAPSHOT_TOLERANCE_SECONDS) return null;
 
     const age = Math.max(0, now - row.generated_at);
     if (age > MAX_AGE_SECONDS) return null;
@@ -181,6 +183,7 @@ export async function readStatusSnapshotPayloadAnyAge(
   try {
     const row = await readStatusSnapshotRow(db);
     if (!row) return null;
+    if (row.generated_at > now + FUTURE_SNAPSHOT_TOLERANCE_SECONDS) return null;
 
     const age = Math.max(0, now - row.generated_at);
     if (age > maxAgeSeconds) return null;
@@ -202,6 +205,7 @@ export async function readStaleStatusSnapshotJson(
   try {
     const row = await readStatusSnapshotRow(db);
     if (!row) return null;
+    if (row.generated_at > now + FUTURE_SNAPSHOT_TOLERANCE_SECONDS) return null;
 
     const age = Math.max(0, now - row.generated_at);
     if (age > maxStaleSeconds) return null;

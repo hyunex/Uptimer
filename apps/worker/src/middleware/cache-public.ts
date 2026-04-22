@@ -9,7 +9,8 @@ import {
 } from '../observability/trace';
 
 function hasAuthorizationHeader(req: { header?(name: string): string | undefined }): boolean {
-  return Boolean(req.header?.('Authorization'));
+  const value = req.header?.('Authorization');
+  return typeof value === 'string' && value.trim().length > 0;
 }
 
 function appendVaryHeader(res: Response, value: string): void {

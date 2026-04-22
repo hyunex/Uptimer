@@ -137,13 +137,6 @@ function parseJsonText(text: string): ParsedJsonText | null {
   }
 }
 
-function normalizeDirectHomepagePayload(
-  value: unknown,
-): string | null {
-  const parsedPayload = parseDirectHomepagePayload(value);
-  return parsedPayload ? JSON.stringify(parsedPayload) : null;
-}
-
 function parseDirectHomepagePayload(value: unknown): PublicHomepageResponse | null {
   const storedPayload = storedPublicHomepageResponseSchema.safeParse(value);
   if (storedPayload.success) {
@@ -195,9 +188,17 @@ function parseStoredHomepageRenderArtifactSnapshot(value: unknown): PublicHomepa
   return parseDirectHomepagePayload(parsedSnapshot.value);
 }
 
+function matchesExpectedGeneratedAt(
+  snapshot: PublicHomepageResponse,
+  expectedGeneratedAt: number | undefined,
+): boolean {
+  return expectedGeneratedAt === undefined || snapshot.generated_at === expectedGeneratedAt;
+}
+
 function normalizeHomepagePayloadBodyJsonForKey(
   key: SnapshotKey,
   bodyJson: string,
+  expectedGeneratedAt?: number,
 ): string | null {
   const parsed = parseJsonText(bodyJson);
   if (parsed === null) return null;
@@ -208,31 +209,48 @@ function normalizeHomepagePayloadBodyJsonForKey(
 
   const version = parsed.value.version;
   if (version === SPLIT_SNAPSHOT_VERSION || version === LEGACY_COMBINED_SNAPSHOT_VERSION) {
-    return normalizeDirectHomepagePayload(parsed.value.data);
+    const directPayload = parseDirectHomepagePayload(parsed.value.data);
+    return directPayload && matchesExpectedGeneratedAt(directPayload, expectedGeneratedAt)
+      ? JSON.stringify(directPayload)
+      : null;
   }
 
   if (key === SNAPSHOT_KEY) {
-    const directPayload = normalizeDirectHomepagePayload(parsed.value);
+    const directPayload = parseDirectHomepagePayload(parsed.value);
     if (directPayload) {
-      return directPayload;
+      return matchesExpectedGeneratedAt(directPayload, expectedGeneratedAt)
+        ? JSON.stringify(directPayload)
+        : null;
     }
   }
 
   const artifactSnapshot = parseStoredHomepageRenderArtifactSnapshot(parsed.value);
-  if (artifactSnapshot) {
+  if (artifactSnapshot && matchesExpectedGeneratedAt(artifactSnapshot, expectedGeneratedAt)) {
     return JSON.stringify(artifactSnapshot);
   }
 
-  return key === SNAPSHOT_KEY ? null : normalizeDirectHomepagePayload(parsed.value);
+  if (key === SNAPSHOT_KEY) {
+    return null;
+  }
+
+  const directPayload = parseDirectHomepagePayload(parsed.value);
+  return directPayload && matchesExpectedGeneratedAt(directPayload, expectedGeneratedAt)
+    ? JSON.stringify(directPayload)
+    : null;
 }
 
-function normalizeHomepageArtifactBodyJson(bodyJson: string): string | null {
+function normalizeHomepageArtifactBodyJson(bodyJson: string, expectedGeneratedAt?: number): string | null {
   const parsed = parseJsonText(bodyJson);
   if (parsed === null) return null;
 
   const artifact = publicHomepageStoredRenderArtifactSchema.safeParse(parsed.value);
   if (artifact.success) {
-    if (parseStoredHomepageRenderArtifactSnapshot(artifact.data) === null) {
+    const snapshot = parseStoredHomepageRenderArtifactSnapshot(artifact.data);
+    if (
+      snapshot === null ||
+      !matchesExpectedGeneratedAt(snapshot, expectedGeneratedAt) ||
+      (expectedGeneratedAt !== undefined && artifact.data.generated_at !== expectedGeneratedAt)
+    ) {
       return null;
     }
     return parsed.trimmed;
@@ -250,7 +268,12 @@ function normalizeHomepageArtifactBodyJson(bodyJson: string): string | null {
   if (!legacyArtifact.success) {
     return null;
   }
-  if (parseStoredHomepageRenderArtifactSnapshot(legacyArtifact.data) === null) {
+  const snapshot = parseStoredHomepageRenderArtifactSnapshot(legacyArtifact.data);
+  if (
+    snapshot === null ||
+    !matchesExpectedGeneratedAt(snapshot, expectedGeneratedAt) ||
+    (expectedGeneratedAt !== undefined && legacyArtifact.data.generated_at !== expectedGeneratedAt)
+  ) {
     return null;
   }
   return JSON.stringify(legacyArtifact.data);
@@ -740,7 +763,11 @@ async function readHomepageSnapshotJsonViaCandidates(
       candidate,
       readRowByKey,
       normalize: (currentCandidate, bodyJson) =>
-        normalizeHomepagePayloadBodyJsonForKey(currentCandidate.key, bodyJson),
+        normalizeHomepagePayloadBodyJsonForKey(
+          currentCandidate.key,
+          bodyJson,
+          currentCandidate.generatedAt,
+        ),
       cacheByDb: normalizedHomepagePayloadCacheByDb,
       globalCache: normalizedHomepagePayloadCacheGlobal,
     });
@@ -786,7 +813,8 @@ async function readHomepageArtifactJsonViaCandidates(
       db,
       candidate,
       readRowByKey,
-      normalize: (_candidate, bodyJson) => normalizeHomepageArtifactBodyJson(bodyJson),
+      normalize: (candidate, bodyJson) =>
+        normalizeHomepageArtifactBodyJson(bodyJson, candidate.generatedAt),
       cacheByDb: normalizedHomepageArtifactCacheByDb,
       globalCache: normalizedHomepageArtifactCacheGlobal,
     });
@@ -866,7 +894,11 @@ export async function readHomepageSnapshotGeneratedAt(
       return liveCandidate.generatedAt;
     }
 
-    const bodyJson = normalizeHomepagePayloadBodyJsonForKey(liveCandidate.key, row.body_json);
+    const bodyJson = normalizeHomepagePayloadBodyJsonForKey(
+      liveCandidate.key,
+      row.body_json,
+      liveCandidate.generatedAt,
+    );
     if (!bodyJson) {
       continue;
     }
@@ -903,7 +935,8 @@ export async function readHomepageArtifactSnapshotGeneratedAt(
       db,
       candidate,
       readRowByKey,
-      normalize: (_candidate, bodyJson) => normalizeHomepageArtifactBodyJson(bodyJson),
+      normalize: (candidate, bodyJson) =>
+        normalizeHomepageArtifactBodyJson(bodyJson, candidate.generatedAt),
       cacheByDb: normalizedHomepageArtifactCacheByDb,
       globalCache: normalizedHomepageArtifactCacheGlobal,
     });
@@ -1180,7 +1213,8 @@ export async function readHomepageSnapshotJsonAnyAge(
     key: SNAPSHOT_KEY,
     now,
     maxAgeSeconds: maxStaleSeconds,
-    normalize: (candidate, bodyJson) => normalizeHomepagePayloadBodyJsonForKey(candidate.key, bodyJson),
+    normalize: (candidate, bodyJson) =>
+      normalizeHomepagePayloadBodyJsonForKey(candidate.key, bodyJson, candidate.generatedAt),
     cacheByDb: normalizedHomepagePayloadCacheByDb,
     globalCache: normalizedHomepagePayloadCacheGlobal,
   });
@@ -1213,7 +1247,8 @@ export async function readHomepageSnapshotArtifactJson(
     key: SNAPSHOT_ARTIFACT_KEY,
     now,
     maxAgeSeconds: MAX_AGE_SECONDS,
-    normalize: (_candidate, bodyJson) => normalizeHomepageArtifactBodyJson(bodyJson),
+    normalize: (candidate, bodyJson) =>
+      normalizeHomepageArtifactBodyJson(bodyJson, candidate.generatedAt),
     cacheByDb: normalizedHomepageArtifactCacheByDb,
     globalCache: normalizedHomepageArtifactCacheGlobal,
   });
@@ -1239,7 +1274,8 @@ export async function readStaleHomepageSnapshotArtifactJson(
     key: SNAPSHOT_ARTIFACT_KEY,
     now,
     maxAgeSeconds: MAX_STALE_SECONDS,
-    normalize: (_candidate, bodyJson) => normalizeHomepageArtifactBodyJson(bodyJson),
+    normalize: (candidate, bodyJson) =>
+      normalizeHomepageArtifactBodyJson(bodyJson, candidate.generatedAt),
     cacheByDb: normalizedHomepageArtifactCacheByDb,
     globalCache: normalizedHomepageArtifactCacheGlobal,
   });

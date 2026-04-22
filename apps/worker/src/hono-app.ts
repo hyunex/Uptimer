@@ -5,6 +5,24 @@ import { handleError, handleNotFound } from './middleware/errors';
 import { publicHotRoutes } from './routes/public-hot';
 
 const app = new Hono<{ Bindings: Env }>();
+const CORS_ALLOW_METHODS = 'GET,POST,PUT,PATCH,DELETE,OPTIONS';
+const CORS_GET_ONLY_METHODS = 'GET, OPTIONS';
+
+function normalizeApiPathname(pathname: string): string {
+  const collapsed = pathname.replace(/\/{2,}/g, '/');
+  if (!collapsed) return '/';
+  if (collapsed.length === 1) return collapsed;
+  return collapsed.replace(/\/+$/, '') || '/';
+}
+
+function isGetOnlyPublicApiPath(pathname: string): boolean {
+  const normalizedPathname = normalizeApiPathname(pathname);
+  return normalizedPathname === '/api/v1/public' || normalizedPathname.startsWith('/api/v1/public/');
+}
+
+function allowedMethodsForApiPath(pathname: string): string {
+  return isGetOnlyPublicApiPath(pathname) ? CORS_GET_ONLY_METHODS : CORS_ALLOW_METHODS;
+}
 
 function appendVaryHeader(res: Response, value: string): void {
   const next = value.trim();
@@ -20,12 +38,13 @@ function appendVaryHeader(res: Response, value: string): void {
 }
 
 function applyCorsHeaders(res: Response, origin: string | null): Response {
-  if (!origin) return res;
   const out = new Response(res.body, res);
-  out.headers.set('Access-Control-Allow-Origin', origin);
   appendVaryHeader(out, 'Origin');
-  out.headers.set('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
-  out.headers.set('Access-Control-Allow-Headers', 'Authorization,Content-Type');
+  if (origin) {
+    out.headers.set('Access-Control-Allow-Origin', origin);
+    out.headers.set('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+    out.headers.set('Access-Control-Allow-Headers', 'Authorization,Content-Type');
+  }
   return out;
 }
 
@@ -45,10 +64,12 @@ function rewriteAdminRequest(req: Request): Request {
 // avoid hardcoding a single hostname in the Worker config.
 app.use('/api/*', async (c, next) => {
   const origin = c.req.header('Origin');
+  const pathname = new URL(c.req.url).pathname;
+  const allowedMethods = allowedMethodsForApiPath(pathname);
+  c.header('Vary', 'Origin');
   if (origin) {
     c.header('Access-Control-Allow-Origin', origin);
-    c.header('Vary', 'Origin');
-    c.header('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+    c.header('Access-Control-Allow-Methods', allowedMethods);
     c.header('Access-Control-Allow-Headers', 'Authorization,Content-Type');
   }
 
@@ -95,4 +116,3 @@ app.all('/api/v1/admin/*', async (c) => {
 });
 
 export const fetch = app.fetch;
-

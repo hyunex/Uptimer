@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 
 import { utcDayStart } from '../analytics/uptime';
-import { AppError } from '../middleware/errors';
+import { AppError, handleError, handleNotFound } from '../middleware/errors';
 import type { Env } from '../env';
 import { hasValidAdminTokenRequest } from '../middleware/auth';
 import { cachePublic } from '../middleware/cache-public';
@@ -324,6 +324,8 @@ export function registerPublicUiAnalyticsRoutes(app: Hono<{ Bindings: Env }>): v
 }
 
 export const publicUiAnalyticsRoutes = new Hono<{ Bindings: Env }>();
+publicUiAnalyticsRoutes.onError(handleError);
+publicUiAnalyticsRoutes.notFound(handleNotFound);
 
 publicUiAnalyticsRoutes.use(
   '*',

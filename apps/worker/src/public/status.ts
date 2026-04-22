@@ -5,7 +5,7 @@ import {
   buildPublicStatusBanner,
   incidentRowToApi,
   listIncidentUpdatesByIncidentId,
-  listVisibleActiveIncidents,
+  readVisibleActiveIncidentSummary,
   listVisibleMaintenanceWindows,
   maintenanceWindowRowToApi,
   readPublicSiteSettings,
@@ -18,12 +18,13 @@ export async function computePublicStatusPayload(
 ): Promise<PublicStatusResponse> {
   const includeHiddenMonitors = opts.includeHiddenMonitors ?? false;
 
-  const [monitorData, activeIncidents, maintenanceWindows, settings] = await Promise.all([
+  const [monitorData, activeIncidentSummary, maintenanceWindows, settings] = await Promise.all([
     buildPublicMonitorCards(db, now, { includeHiddenMonitors }),
-    listVisibleActiveIncidents(db, includeHiddenMonitors),
+    readVisibleActiveIncidentSummary(db, includeHiddenMonitors),
     listVisibleMaintenanceWindows(db, now, includeHiddenMonitors),
     readPublicSiteSettings(db),
   ]);
+  const activeIncidents = activeIncidentSummary.items;
 
   const incidentUpdatesByIncidentId = await listIncidentUpdatesByIncidentId(
     db,
@@ -43,6 +44,7 @@ export async function computePublicStatusPayload(
       monitorCount: monitorData.monitors.length,
       activeIncidents,
       activeMaintenanceWindows: maintenanceWindows.active,
+      bannerIncident: activeIncidentSummary.bannerIncident,
     }),
     summary: monitorData.summary,
     monitors: monitorData.monitors,
