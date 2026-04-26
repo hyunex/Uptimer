@@ -2152,6 +2152,7 @@ async function readHomepageScheduledFastGuardState(
   db: D1Database,
   now: number,
   includeHiddenMonitors: boolean,
+  trace?: Trace,
 ): Promise<{
   settings: HomepagePublicSettings;
   monitorMetadataStamp: HomepageMonitorMetadataStamp;
@@ -2164,7 +2165,7 @@ async function readHomepageScheduledFastGuardState(
   const incidentVisibilitySql = incidentStatusPageVisibilityPredicate(includeHiddenMonitors);
   const maintenanceVisibilitySql =
     maintenanceWindowStatusPageVisibilityPredicate(includeHiddenMonitors);
-  const row = await getCachedHomepageStatement(
+  const statement = getCachedHomepageStatement(
     db,
     includeHiddenMonitors ? 'scheduledFastGuardIncludingHidden' : 'scheduledFastGuard',
     () =>
@@ -2245,9 +2246,9 @@ async function readHomepageScheduledFastGuardState(
         ) AS has_maintenance_history_preview
     `,
       ),
-  )
-    .bind(now)
-    .first<{
+  );
+  const row = await withTraceAsync(trace, 'homepage_refresh_fast_guard_query', async () =>
+    await statement.bind(now).first<{
       site_title_value: string | null;
       site_description_value: string | null;
       site_locale_value: string | null;
@@ -2260,9 +2261,10 @@ async function readHomepageScheduledFastGuardState(
       has_active_maintenance: number | null;
       has_upcoming_maintenance: number | null;
       has_maintenance_history_preview: number | null;
-    }>();
+    }>(),
+  );
 
-  return {
+  return withTraceSync(trace, 'homepage_refresh_fast_guard_normalize', () => ({
     settings: normalizeHomepageFastGuardSettings({
       site_title_value: row?.site_title_value,
       site_description_value: row?.site_description_value,
@@ -2279,7 +2281,7 @@ async function readHomepageScheduledFastGuardState(
     hasUpcomingMaintenance: (row?.has_upcoming_maintenance ?? 0) > 0,
     hasResolvedIncidentPreview: (row?.has_resolved_incident_preview ?? 0) > 0,
     hasMaintenanceHistoryPreview: (row?.has_maintenance_history_preview ?? 0) > 0,
-  };
+  }));
 }
 
 export async function tryComputePublicHomepagePayloadFromScheduledRuntimeUpdates(opts: {
@@ -2301,7 +2303,13 @@ export async function tryComputePublicHomepagePayloadFromScheduledRuntimeUpdates
   const guardState = await withTraceAsync(
     opts.trace,
     'homepage_refresh_fast_guard',
-    async () => await readHomepageScheduledFastGuardState(opts.db, opts.now, includeHiddenMonitors),
+    async () =>
+      await readHomepageScheduledFastGuardState(
+        opts.db,
+        opts.now,
+        includeHiddenMonitors,
+        opts.trace,
+      ),
   );
   opts.onGuardState?.({
     settings: guardState.settings,

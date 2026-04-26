@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
+import { Trace } from '../src/observability/trace';
 import {
   tryComputePublicHomepagePayloadFromScheduledRuntimeUpdates,
   tryPatchPublicHomepagePayloadFromRuntimeUpdates,
@@ -391,14 +392,19 @@ describe('public fast-path guards', () => {
       },
     ];
 
+    const trace = new Trace({ enabled: true, id: 'trace-test', mode: 'scheduled' });
     const patched = await tryComputePublicHomepagePayloadFromScheduledRuntimeUpdates({
       db: createFakeD1Database(handlers),
       now,
       baseSnapshot,
       baseSnapshotBodyJson: null,
       updates: [],
+      trace,
     });
 
     expect(patched).toBeNull();
+    const serverTiming = trace.toServerTiming('w');
+    expect(serverTiming).toContain('w_homepage_refresh_fast_guard_query');
+    expect(serverTiming).toContain('w_homepage_refresh_fast_guard_normalize');
   });
 });
