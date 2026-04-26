@@ -40,6 +40,7 @@ import {
   writeHomepageSnapshot,
 } from '../src/snapshots/public-homepage';
 import { didApplyStatusSnapshotWrite, prepareStatusSnapshotWrite } from '../src/snapshots/public-status';
+import { primeStatusSnapshotCache } from '../src/snapshots/public-status-read';
 import { createFakeD1Database } from './helpers/fake-d1';
 
 function createBaseSnapshot(now: number) {
@@ -98,7 +99,38 @@ function createBaseSnapshot(now: number) {
   };
 }
 
-function createEnv(now: number): Env {
+function createStatusSnapshot(now: number) {
+  return {
+    generated_at: now - 60,
+    site_title: 'Status Hub',
+    site_description: 'Production services',
+    site_locale: 'en' as const,
+    site_timezone: 'UTC',
+    uptime_rating_level: 4 as const,
+    overall_status: 'up' as const,
+    banner: {
+      source: 'monitors' as const,
+      status: 'operational' as const,
+      title: 'All Systems Operational',
+      down_ratio: null,
+    },
+    summary: {
+      up: 0,
+      down: 0,
+      maintenance: 0,
+      paused: 0,
+      unknown: 0,
+    },
+    monitors: [],
+    active_incidents: [],
+    maintenance_windows: {
+      active: [],
+      upcoming: [],
+    },
+  };
+}
+
+function createEnv(now: number, statusSnapshot: ReturnType<typeof createStatusSnapshot> | null = null): Env {
   const baseSnapshot = createBaseSnapshot(now);
   return {
     DB: createFakeD1Database([
@@ -125,7 +157,14 @@ function createEnv(now: number): Env {
       },
       {
         match: 'select generated_at, updated_at, body_json from public_snapshots',
-        first: () => null,
+        first: () =>
+          statusSnapshot
+            ? {
+                generated_at: statusSnapshot.generated_at,
+                updated_at: statusSnapshot.generated_at,
+                body_json: JSON.stringify(statusSnapshot),
+              }
+            : null,
       },
     ]),
     ADMIN_TOKEN: 'test-admin-token',
@@ -1287,7 +1326,8 @@ describe('internal homepage refresh route', () => {
   it('emits internal refresh trace labels when the trace token matches', async () => {
     const now = 1_776_230_340;
     vi.spyOn(Date, 'now').mockReturnValue(now * 1000);
-    const env = createEnv(now);
+    const statusSnapshot = createStatusSnapshot(now);
+    const env = createEnv(now, statusSnapshot);
     (env as unknown as Record<string, unknown>).UPTIMER_TRACE_TOKEN = 'expected-token';
     const baseSnapshot = createBaseSnapshot(now);
     vi.mocked(tryComputePublicHomepagePayloadFromScheduledRuntimeUpdates).mockResolvedValue(
@@ -1352,9 +1392,65 @@ describe('internal homepage refresh route', () => {
     expect(res.headers.get('X-Uptimer-Trace')).toContain('runtime_updates_fast_path_count=1');
     expect(res.headers.get('X-Uptimer-Trace')).toContain('skip_initial_freshness_check=1');
     expect(res.headers.get('X-Uptimer-Trace')).toContain('fast_path=scheduled_runtime');
+    expect(res.headers.get('X-Uptimer-Trace')).toContain('status_base_snapshot=d1');
     expect(res.headers.get('X-Uptimer-Trace')).toContain('status_refresh=patched');
+    expect(res.headers.get('Server-Timing')).toContain('w_status_refresh_read_base_snapshot');
     expect(res.headers.get('Server-Timing')).toContain('w_snapshot_writes_batch');
     expect(res.headers.get('Server-Timing')).toContain('w_total');
     expect(consoleLogSpy).toHaveBeenCalledWith(expect.stringContaining('internal-refresh:'));
+  });
+
+  it('uses the cached status snapshot base in internal refresh traces when available', async () => {
+    const now = 1_776_230_340;
+    vi.spyOn(Date, 'now').mockReturnValue(now * 1000);
+    const env = createEnv(now);
+    (env as unknown as Record<string, unknown>).UPTIMER_TRACE_TOKEN = 'expected-token';
+    const baseSnapshot = createBaseSnapshot(now);
+    const statusSnapshot = createStatusSnapshot(now);
+    primeStatusSnapshotCache({
+      db: env.DB,
+      generatedAt: statusSnapshot.generated_at,
+      updatedAt: statusSnapshot.generated_at,
+      bodyJson: JSON.stringify(statusSnapshot),
+      data: statusSnapshot,
+    });
+    vi.mocked(tryComputePublicHomepagePayloadFromScheduledRuntimeUpdates).mockResolvedValue(
+      {
+        ...baseSnapshot,
+        generated_at: now,
+      } as never,
+    );
+    vi.mocked(tryComputePublicStatusPayloadFromScheduledRuntimeUpdates).mockResolvedValue({
+      ...statusSnapshot,
+      generated_at: now,
+    } as never);
+
+    const res = await worker.fetch(
+      new Request('http://internal/api/v1/internal/refresh/homepage', {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer test-admin-token',
+          'Content-Type': 'application/json; charset=utf-8',
+          'X-Uptimer-Trace': '1',
+          'X-Uptimer-Trace-Id': 'trace-456',
+          'X-Uptimer-Trace-Token': 'expected-token',
+          'X-Uptimer-Trace-Mode': 'scheduled',
+          'X-Uptimer-Refresh-Source': 'scheduled',
+        },
+        body: JSON.stringify({
+          token: 'test-admin-token',
+          runtime_updates: [[1, 60, now - 300, now, 'up', 'up', 55]],
+        }),
+      }),
+      env,
+      { waitUntil: vi.fn() } as unknown as ExecutionContext,
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get('X-Uptimer-Trace')).toContain('status_base_snapshot=memory_cache');
+    expect(res.headers.get('Server-Timing')).not.toContain('w_status_refresh_read_base_snapshot');
+    expect(tryComputePublicStatusPayloadFromScheduledRuntimeUpdates).toHaveBeenCalledWith(
+      expect.objectContaining({ baseSnapshot: statusSnapshot }),
+    );
   });
 });
