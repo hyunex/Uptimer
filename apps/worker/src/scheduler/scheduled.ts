@@ -1326,6 +1326,7 @@ export async function runScheduledTick(env: Env, ctx: ExecutionContext): Promise
         scheduledRefreshRequest: true,
         ...(runtimeUpdates?.length ? { runtimeUpdates } : {}),
         trace: null,
+        preferCachedBaseSnapshot: true,
       })
         .then((result) => {
           console.log(

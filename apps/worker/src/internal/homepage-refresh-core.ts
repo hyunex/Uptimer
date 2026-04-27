@@ -33,6 +33,7 @@ export type InternalHomepageRefreshCoreOptions = {
   scheduledRefreshRequest: boolean;
   runtimeUpdates?: MonitorRuntimeUpdate[];
   trace?: Trace | null;
+  preferCachedBaseSnapshot?: boolean;
 };
 
 export function normalizeInternalTruthy(value: string | null | undefined): boolean {
@@ -250,6 +251,7 @@ export async function runInternalHomepageRefreshCore({
   scheduledRefreshRequest,
   runtimeUpdates,
   trace,
+  preferCachedBaseSnapshot = false,
 }: InternalHomepageRefreshCoreOptions): Promise<InternalHomepageRefreshCoreResult> {
   const traceResidualDetails = shouldTraceHomepageResidualDetails(env, trace);
   const detailTrace: Trace | undefined = traceResidualDetails && trace ? trace : undefined;
@@ -300,7 +302,11 @@ export async function runInternalHomepageRefreshCore({
     | null = null;
 
   try {
-    const { readHomepageRefreshBaseSnapshot, readHomepageSnapshotGeneratedAt } = trace
+    const {
+      readCachedHomepageRefreshBaseSnapshot,
+      readHomepageRefreshBaseSnapshot,
+      readHomepageSnapshotGeneratedAt,
+    } = trace
       ? await trace.timeAsync(
           'import_homepage_snapshot_read_module',
           async () => await import('../snapshots/public-homepage-read'),
@@ -360,13 +366,19 @@ export async function runInternalHomepageRefreshCore({
       logPrefix: 'internal refresh',
     });
 
-    const baseSnapshot = trace
-      ? await trace.timeAsync(
-          'homepage_refresh_read_snapshot_base',
-          async () => await readHomepageRefreshBaseSnapshot(env.DB, now),
-        )
-      : await readHomepageRefreshBaseSnapshot(env.DB, now);
+    const cachedBaseSnapshot = preferCachedBaseSnapshot
+      ? readCachedHomepageRefreshBaseSnapshot(env.DB, now)
+      : null;
+    const baseSnapshot = cachedBaseSnapshot
+      ? cachedBaseSnapshot
+      : trace
+        ? await trace.timeAsync(
+            'homepage_refresh_read_snapshot_base',
+            async () => await readHomepageRefreshBaseSnapshot(env.DB, now),
+          )
+        : await readHomepageRefreshBaseSnapshot(env.DB, now);
     if (trace?.enabled) {
+      trace.setLabel('base_snapshot', cachedBaseSnapshot ? 'memory_cache' : 'd1');
       trace.setLabel('base_seed_data', baseSnapshot.seedDataSnapshot ? '1' : '0');
       trace.setLabel(
         'base_age_s',

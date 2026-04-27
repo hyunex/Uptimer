@@ -25,6 +25,7 @@ import {
   writeHomepageSnapshot,
 } from '../src/snapshots/public-homepage';
 import {
+  readCachedHomepageRefreshBaseSnapshot,
   readHomepageRefreshBaseSnapshot,
   readHomepageSnapshotJsonAnyAge,
   readStaleHomepageSnapshotArtifactJson as readStaleHomepageSnapshotArtifactJsonHot,
@@ -812,6 +813,55 @@ describe('snapshots/public-homepage', () => {
       snapshot: artifactPayload,
       seedDataSnapshot: false,
     });
+  });
+
+  it('uses a primed parsed cache as a cache-only refresh base snapshot', async () => {
+    const now = 1_728_000_500;
+    const payload = samplePayload(now - 300);
+    const artifactPayload = samplePayload(now - 60);
+    let readCount = 0;
+    const db = createFakeD1Database([
+      {
+        match: 'select key, generated_at, updated_at, body_json from public_snapshots',
+        all: () => {
+          readCount += 1;
+          return [
+            {
+              key: 'homepage',
+              generated_at: payload.generated_at,
+              updated_at: payload.generated_at,
+              body_json: JSON.stringify(payload),
+            },
+            {
+              key: 'homepage:artifact',
+              generated_at: artifactPayload.generated_at,
+              updated_at: artifactPayload.generated_at,
+              body_json: JSON.stringify(buildHomepageRenderArtifact(artifactPayload)),
+            },
+          ];
+        },
+      },
+    ]);
+
+    await expect(readHomepageRefreshBaseSnapshot(db, now)).resolves.toEqual({
+      generatedAt: artifactPayload.generated_at,
+      snapshot: artifactPayload,
+      seedDataSnapshot: false,
+    });
+
+    expect(readCachedHomepageRefreshBaseSnapshot(db, now)).toEqual({
+      generatedAt: artifactPayload.generated_at,
+      snapshot: artifactPayload,
+      seedDataSnapshot: false,
+    });
+    expect(readCount).toBe(1);
+  });
+
+  it('returns null for cache-only refresh base reads when the per-DB cache is cold', () => {
+    const now = 1_728_000_500;
+    const db = createFakeD1Database([]);
+
+    expect(readCachedHomepageRefreshBaseSnapshot(db, now)).toBeNull();
   });
 
   it('uses the same-day homepage payload row as the refresh base from the batch snapshot read', async () => {

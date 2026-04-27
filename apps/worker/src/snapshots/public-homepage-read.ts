@@ -112,6 +112,12 @@ type RefreshSnapshotReadContext = {
   readRowByKey: (key: SnapshotKey) => Promise<SnapshotRefreshRow | null>;
 };
 
+export type HomepageRefreshBaseSnapshotReadResult = {
+  generatedAt: number | null;
+  snapshot: PublicHomepageResponse | null;
+  seedDataSnapshot: boolean;
+};
+
 function isNoFakeD1HandlerError(err: unknown): err is Error {
   return (
     err instanceof Error &&
@@ -948,14 +954,79 @@ export async function readHomepageArtifactSnapshotGeneratedAt(
   return null;
 }
 
+export function readCachedHomepageRefreshBaseSnapshot(
+  db: D1Database,
+  now: number,
+): HomepageRefreshBaseSnapshotReadResult | null {
+  const cache = parsedHomepagePayloadCacheByDb.get(db);
+  if (!cache) {
+    return null;
+  }
+
+  const toCandidate = (key: SnapshotKey): (SnapshotCandidate & { row: ParsedSnapshotRow }) | null => {
+    const row = cache.get(key);
+    if (!row) {
+      return null;
+    }
+
+    const candidate = {
+      key,
+      generatedAt: row.generatedAt,
+      updatedAt: row.updatedAt,
+    };
+    if (
+      isFutureSnapshotCandidate(candidate, now) ||
+      !snapshotMatchesCandidateGeneratedAt(candidate, row.snapshot)
+    ) {
+      return null;
+    }
+
+    return { ...candidate, row };
+  };
+
+  const homepageCandidate = toCandidate(SNAPSHOT_KEY);
+  const artifactCandidate = toCandidate(SNAPSHOT_ARTIFACT_KEY);
+
+  if (homepageCandidate && isSameUtcDay(homepageCandidate.generatedAt, now)) {
+    if (
+      !artifactCandidate ||
+      !isSameUtcDay(artifactCandidate.generatedAt, now) ||
+      comparePayloadCandidates(artifactCandidate, homepageCandidate) >= 0
+    ) {
+      return {
+        generatedAt: homepageCandidate.row.generatedAt,
+        snapshot: homepageCandidate.row.snapshot,
+        seedDataSnapshot: false,
+      };
+    }
+  }
+
+  if (artifactCandidate && isSameUtcDay(artifactCandidate.generatedAt, now)) {
+    return {
+      generatedAt: artifactCandidate.row.generatedAt,
+      snapshot: artifactCandidate.row.snapshot,
+      seedDataSnapshot: false,
+    };
+  }
+
+  const freshestBase = [homepageCandidate, artifactCandidate]
+    .filter((candidate): candidate is SnapshotCandidate & { row: ParsedSnapshotRow } => candidate !== null)
+    .sort(comparePayloadCandidates)[0];
+  if (!freshestBase) {
+    return null;
+  }
+
+  return {
+    generatedAt: freshestBase.row.generatedAt,
+    snapshot: freshestBase.row.snapshot,
+    seedDataSnapshot: true,
+  };
+}
+
 export async function readHomepageRefreshBaseSnapshot(
   db: D1Database,
   now: number,
-): Promise<{
-  generatedAt: number | null;
-  snapshot: PublicHomepageResponse | null;
-  seedDataSnapshot: boolean;
-}> {
+): Promise<HomepageRefreshBaseSnapshotReadResult> {
   let invalid = false;
   const parsedByKey = new Map<SnapshotKey, ParsedSnapshotRow | null>();
   const rowByKey = new Map<SnapshotKey, SnapshotRefreshRow | null>();

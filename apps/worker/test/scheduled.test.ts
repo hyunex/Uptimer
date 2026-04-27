@@ -355,6 +355,7 @@ describe('scheduler/scheduled regression', () => {
       now: Math.floor(Date.now() / 1000),
       scheduledRefreshRequest: true,
       trace: null,
+      preferCachedBaseSnapshot: true,
     });
     expect(logSpy).toHaveBeenCalledWith(
       expect.stringContaining('scheduled: homepage_refresh_direct route=internal/homepage-refresh mode=scheduled direct=1 ok=1 refreshed=1'),
