@@ -794,45 +794,58 @@ async function handleInternalHomepageRefresh(request: Request, env: Env): Promis
           snapshotMod.toHomepageSnapshotPayload(payload),
         )
       : snapshotMod.toHomepageSnapshotPayload(payload);
-    const cachedStatusBaseSnapshot = statusSnapshotReadMod.readCachedStatusSnapshotPayloadAnyAge(
-      env.DB,
-      now,
-    );
-    if (trace?.enabled && cachedStatusBaseSnapshot) {
-      trace.setLabel('status_base_snapshot', 'memory_cache');
-    }
-    const statusBaseSnapshot = cachedStatusBaseSnapshot
-      ? cachedStatusBaseSnapshot
-      : trace
+    const shouldRefreshStatusSnapshot =
+      normalizeTruthyHeader(env.UPTIMER_SCHEDULED_STATUS_REFRESH ?? '1');
+    let refreshedStatusPayload: Awaited<
+      ReturnType<typeof statusMod.tryComputePublicStatusPayloadFromScheduledRuntimeUpdates>
+    > | null = null;
+    if (shouldRefreshStatusSnapshot) {
+      const cachedStatusBaseSnapshot = statusSnapshotReadMod.readCachedStatusSnapshotPayloadAnyAge(
+        env.DB,
+        now,
+      );
+      if (trace?.enabled && cachedStatusBaseSnapshot) {
+        trace.setLabel('status_base_snapshot', 'memory_cache');
+      }
+      const statusBaseSnapshot = cachedStatusBaseSnapshot
+        ? cachedStatusBaseSnapshot
+        : trace
+          ? await trace.timeAsync(
+              'status_refresh_read_base_snapshot',
+              async () => await statusSnapshotReadMod.readStatusSnapshotPayloadAnyAge(env.DB, now),
+            )
+          : await statusSnapshotReadMod.readStatusSnapshotPayloadAnyAge(env.DB, now);
+      if (trace?.enabled && !cachedStatusBaseSnapshot && statusBaseSnapshot) {
+        trace.setLabel('status_base_snapshot', 'd1');
+      }
+      const statusRefreshArgs = statusFastGuardState
+        ? {
+            db: env.DB,
+            now,
+            updates: fastPathRuntimeUpdates,
+            guardState: statusFastGuardState,
+            baseSnapshot: statusBaseSnapshot?.data ?? null,
+          }
+        : {
+            db: env.DB,
+            now,
+            updates: fastPathRuntimeUpdates,
+            baseSnapshot: statusBaseSnapshot?.data ?? null,
+          };
+      refreshedStatusPayload = trace
         ? await trace.timeAsync(
-            'status_refresh_read_base_snapshot',
-            async () => await statusSnapshotReadMod.readStatusSnapshotPayloadAnyAge(env.DB, now),
+            'status_refresh_fast_compute',
+            async () =>
+              await statusMod.tryComputePublicStatusPayloadFromScheduledRuntimeUpdates(
+                statusRefreshArgs,
+              ),
           )
-        : await statusSnapshotReadMod.readStatusSnapshotPayloadAnyAge(env.DB, now);
-    if (trace?.enabled && !cachedStatusBaseSnapshot && statusBaseSnapshot) {
-      trace.setLabel('status_base_snapshot', 'd1');
+        : await statusMod.tryComputePublicStatusPayloadFromScheduledRuntimeUpdates(
+            statusRefreshArgs,
+          );
+    } else if (trace?.enabled) {
+      trace.setLabel('status_refresh', 'disabled');
     }
-    const statusRefreshArgs = statusFastGuardState
-      ? {
-          db: env.DB,
-          now,
-          updates: fastPathRuntimeUpdates,
-          guardState: statusFastGuardState,
-          baseSnapshot: statusBaseSnapshot?.data ?? null,
-        }
-      : {
-          db: env.DB,
-          now,
-          updates: fastPathRuntimeUpdates,
-          baseSnapshot: statusBaseSnapshot?.data ?? null,
-        };
-    const refreshedStatusPayload = trace
-      ? await trace.timeAsync(
-          'status_refresh_fast_compute',
-          async () =>
-            await statusMod.tryComputePublicStatusPayloadFromScheduledRuntimeUpdates(statusRefreshArgs),
-        )
-      : await statusMod.tryComputePublicStatusPayloadFromScheduledRuntimeUpdates(statusRefreshArgs);
 
     homepageRefreshLease.assertHeld('writing homepage snapshot');
     const activeHomepageRefreshLease = homepageRefreshLease;

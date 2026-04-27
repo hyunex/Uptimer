@@ -10,6 +10,7 @@ export interface Env {
   UPTIMER_TRACE_TOKEN?: string;
   TRACE_TOKEN?: string;
   UPTIMER_HOMEPAGE_RESIDUAL_TRACE?: string;
+  UPTIMER_SCHEDULED_STATUS_REFRESH?: string;
 
   // In-memory, per-instance rate limit for admin endpoints.
   // Keep optional so older deployments don't break.
