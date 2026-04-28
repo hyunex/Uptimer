@@ -199,6 +199,15 @@ function shouldSkipScheduledHomepageRefreshForShardedSnapshots(env: Env): boolea
   );
 }
 
+function shouldUseScheduledShardedContinuation(env: Env): boolean {
+  const rawEnv = env as unknown as Record<string, unknown>;
+  return (
+    Boolean(env.SELF) &&
+    isTruthyEnvFlag(rawEnv.UPTIMER_SCHEDULED_SHARDED_CONTINUATION) &&
+    (shouldSeedScheduledShardedFragments(env) || shouldAssembleScheduledShardedSnapshots(env))
+  );
+}
+
 function readBoundedPositiveIntegerEnv(
   env: Env,
   key: string,
@@ -465,6 +474,54 @@ async function runScheduledShardedPublicSnapshotWork(env: Env): Promise<void> {
       );
     }
   }
+}
+
+async function startShardedPublicSnapshotContinuationViaService(
+  env: Env,
+  opts: { refreshRuntimeFragments: boolean },
+): Promise<void> {
+  if (!env.ADMIN_TOKEN) {
+    throw new Error('ADMIN_TOKEN missing');
+  }
+
+  const monitorLimit = readBoundedPositiveIntegerEnv(
+    env,
+    'UPTIMER_SHARDED_FRAGMENT_SEED_BATCH_SIZE',
+    SHARDED_FRAGMENT_SEED_BATCH_SIZE,
+    1,
+    10,
+  );
+  const body = opts.refreshRuntimeFragments
+    ? { step: 'runtime' }
+    : {
+        step: 'seed',
+        kind: 'homepage',
+        part: 'envelope',
+        monitor_offset: 0,
+        monitor_limit: monitorLimit,
+      };
+  const res = await fetchSelfWithTimeout(
+    env,
+    new Request('http://internal/api/v1/internal/continue/sharded-public-snapshot', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${env.ADMIN_TOKEN}`,
+        'Content-Type': 'application/json; charset=utf-8',
+      },
+      body: JSON.stringify(body),
+    }),
+    SHARDED_PUBLIC_SNAPSHOT_SERVICE_TIMEOUT_MS,
+    'sharded public snapshot continuation service',
+  );
+  const bodyText = await res.text().catch(() => '');
+  if (!res.ok) {
+    throw new Error(`sharded public snapshot continuation failed: HTTP ${res.status} ${bodyText}`.trim());
+  }
+  const parsed = parseJsonObject(bodyText);
+  const continued = typeof parsed?.continued === 'boolean' ? parsed.continued : null;
+  console.log(
+    `scheduled: sharded_continuation_start step=${String(body.step)} continued=${continued === null ? '-' : continued ? 1 : 0}`,
+  );
 }
 
 async function refreshHomepageSnapshotViaService(
@@ -1617,7 +1674,13 @@ export async function runScheduledTick(env: Env, ctx: ExecutionContext): Promise
       console.log(
         `scheduled: homepage_refresh_skip reason=sharded_public_snapshots runtime_updates=${runtimeUpdates?.length ?? 0}`,
       );
-      return queueShardedPublicSnapshotWork();
+      return shouldUseScheduledShardedContinuation(env)
+        ? startShardedPublicSnapshotContinuationViaService(env, { refreshRuntimeFragments: false })
+            .catch((err) => {
+              console.warn('scheduled sharded public snapshot continuation failed', err);
+              return queueShardedPublicSnapshotWork();
+            })
+        : queueShardedPublicSnapshotWork();
     }
 
     let refreshPromise: Promise<void>;
@@ -1876,6 +1939,24 @@ export async function runScheduledTick(env: Env, ctx: ExecutionContext): Promise
     }
 
     const queuePostCheckRefresh = () => {
+      if (
+        shouldUseScheduledShardedContinuation(env) &&
+        shouldSkipScheduledHomepageRefreshForShardedSnapshots(env) &&
+        !requiresFullHomepageRefresh
+      ) {
+        return startShardedPublicSnapshotContinuationViaService(env, {
+          refreshRuntimeFragments: activeRuntimeFragmentPipeline,
+        }).catch(async (err) => {
+          console.warn('sharded continuation: service start failed', err);
+          if (activeRuntimeFragmentPipeline) {
+            await refreshRuntimeFragmentsViaService(env).catch((refreshErr) => {
+              console.warn('runtime fragments refresh: service refresh failed', refreshErr);
+            });
+          }
+          await queueHomepageRefresh();
+        });
+      }
+
       if (activeRuntimeFragmentPipeline && !requiresFullHomepageRefresh) {
         return refreshRuntimeFragmentsViaService(env)
           .then(() => queueHomepageRefresh())

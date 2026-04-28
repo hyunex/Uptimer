@@ -125,6 +125,21 @@ const internalShardedPublicSnapshotSeedBodySchema = z.object({
   monitor_limit: z.number().int().min(1).max(10).optional().default(5),
 });
 
+const internalShardedPublicSnapshotContinuationBodySchema = z.discriminatedUnion('step', [
+  z.object({ step: z.literal('runtime') }),
+  z.object({
+    step: z.literal('seed'),
+    kind: z.enum(['homepage', 'status']),
+    part: z.enum(['envelope', 'monitors']),
+    monitor_offset: z.number().int().min(0).optional().default(0),
+    monitor_limit: z.number().int().min(1).max(10).optional().default(5),
+  }),
+  z.object({
+    step: z.literal('assemble'),
+    kind: z.enum(['homepage', 'status']),
+  }),
+]);
+
 type InternalScheduledCheckBatchBody = {
   token?: string;
   ids: number[];
@@ -470,6 +485,88 @@ async function handleInternalShardedPublicSnapshotSeed(
   );
 }
 
+async function handleInternalShardedPublicSnapshotContinuation(
+  request: Request,
+  env: Env,
+  ctx: ExecutionContext,
+): Promise<Response> {
+  if (!isInternalServiceRequest(request)) {
+    return buildNotFoundJsonResponse(request.headers.get('Origin'));
+  }
+  if (request.method !== 'POST') {
+    return new Response('Method Not Allowed', { status: 405 });
+  }
+  if (!normalizeTruthyHeader(env.UPTIMER_SCHEDULED_SHARDED_CONTINUATION ?? null)) {
+    return buildNotFoundJsonResponse(request.headers.get('Origin'));
+  }
+  if (!hasValidInternalAuth(request, env)) {
+    return new Response('Forbidden', { status: 403 });
+  }
+  if (isRequestBodyTooLarge(request)) {
+    return new Response('Payload Too Large', { status: 413 });
+  }
+
+  const body = await request.json().catch(() => null);
+  const parsed = internalShardedPublicSnapshotContinuationBodySchema.safeParse(body);
+  if (!parsed.success) {
+    return new Response('Bad Request', { status: 400 });
+  }
+
+  const { runShardedPublicSnapshotContinuation } = await import(
+    './internal/sharded-public-snapshot-continuation'
+  );
+  const result = await runShardedPublicSnapshotContinuation({
+    env,
+    ctx,
+    now: Math.floor(Date.now() / 1000),
+    step: parsed.data.step === 'runtime'
+      ? { step: 'runtime' }
+      : parsed.data.step === 'assemble'
+        ? { step: 'assemble', kind: parsed.data.kind }
+        : {
+            step: 'seed',
+            kind: parsed.data.kind,
+            part: parsed.data.part,
+            monitorOffset: parsed.data.monitor_offset,
+            monitorLimit: parsed.data.monitor_limit,
+          },
+  });
+  const nextStep = result.nextStep
+    ? result.nextStep.step === 'runtime'
+      ? { step: 'runtime' }
+      : result.nextStep.step === 'assemble'
+        ? { step: 'assemble', kind: result.nextStep.kind }
+        : {
+            step: 'seed',
+            kind: result.nextStep.kind,
+            part: result.nextStep.part,
+            monitor_offset: result.nextStep.monitorOffset ?? 0,
+            monitor_limit: result.nextStep.monitorLimit ?? 5,
+          }
+    : undefined;
+  return buildInternalJsonResponse(
+    {
+      ok: result.ok,
+      step: result.step,
+      continued: result.continued,
+      ...(result.refreshed !== undefined ? { refreshed: result.refreshed } : {}),
+      ...(result.seeded !== undefined ? { seeded: result.seeded } : {}),
+      ...(result.assembled !== undefined ? { assembled: result.assembled } : {}),
+      ...(result.kind ? { kind: result.kind } : {}),
+      ...(result.part ? { part: result.part } : {}),
+      ...(result.monitorCount !== undefined ? { monitor_count: result.monitorCount } : {}),
+      ...(result.monitorOffset !== undefined ? { monitor_offset: result.monitorOffset } : {}),
+      ...(result.monitorLimit !== undefined ? { monitor_limit: result.monitorLimit } : {}),
+      ...(result.writeCount !== undefined ? { write_count: result.writeCount } : {}),
+      ...(result.invalidCount !== undefined ? { invalid_count: result.invalidCount } : {}),
+      ...(result.staleCount !== undefined ? { stale_count: result.staleCount } : {}),
+      ...(result.skipped ? { skipped: result.skipped } : {}),
+      ...(nextStep ? { next_step: nextStep } : {}),
+    },
+    result.ok,
+  );
+}
+
 async function handleInternalRuntimeFragmentsRefresh(
   request: Request,
   env: Env,
@@ -708,6 +805,9 @@ export default {
     }
     if (url.pathname === '/api/v1/internal/seed/sharded-public-snapshot') {
       return handleInternalShardedPublicSnapshotSeed(request, env);
+    }
+    if (url.pathname === '/api/v1/internal/continue/sharded-public-snapshot') {
+      return handleInternalShardedPublicSnapshotContinuation(request, env, ctx);
     }
 
     const mod = await import('./fetch-handler');

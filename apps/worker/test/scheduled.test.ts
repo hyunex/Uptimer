@@ -460,6 +460,7 @@ describe('scheduler/scheduled regression', () => {
     env.UPTIMER_PUBLIC_SHARDED_ASSEMBLER = '1';
     env.UPTIMER_SCHEDULED_SHARDED_ASSEMBLER = '1';
     env.UPTIMER_SCHEDULED_SHARDED_SKIP_HOMEPAGE_REFRESH = '1';
+    env.UPTIMER_SCHEDULED_SHARDED_CONTINUATION = '1';
     env.UPTIMER_SHARDED_ASSEMBLER_MODE = 'json';
     env.UPTIMER_SHARDED_FRAGMENT_SEED_BATCH_SIZE = '2';
     const selfFetch = vi.fn(async (request: Request) => {
@@ -467,34 +468,11 @@ describe('scheduler/scheduled regression', () => {
       if (path === '/api/v1/internal/refresh/homepage') {
         throw new Error('monolithic homepage refresh should be skipped');
       }
-      if (path === '/api/v1/internal/seed/sharded-public-snapshot') {
-        const body = await request.json();
-        return new Response(
-          JSON.stringify({
-            ok: true,
-            seeded: true,
-            kind: (body as { kind: string }).kind,
-            part: (body as { part: string }).part,
-            monitor_count: 3,
-            write_count: (body as { part: string }).part === 'envelope' ? 1 : 2,
-          }),
-          { status: 200, headers: { 'Content-Type': 'application/json; charset=utf-8' } },
-        );
-      }
-      if (path === '/api/v1/internal/assemble/sharded-public-snapshot') {
-        const body = await request.json();
-        return new Response(
-          JSON.stringify({
-            ok: true,
-            assembled: true,
-            kind: (body as { kind: string }).kind,
-            assembly: (body as { assembly: string }).assembly,
-            monitor_count: 3,
-            invalid_count: 0,
-            stale_count: 0,
-          }),
-          { status: 200, headers: { 'Content-Type': 'application/json; charset=utf-8' } },
-        );
+      if (path === '/api/v1/internal/continue/sharded-public-snapshot') {
+        return new Response(JSON.stringify({ ok: true, continued: true }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json; charset=utf-8' },
+        });
       }
       throw new Error(`unexpected self fetch: ${path}`);
     });
@@ -507,17 +485,17 @@ describe('scheduler/scheduled regression', () => {
     expect(waitUntil).toHaveBeenCalledTimes(1);
     await Promise.all(waitUntil.mock.calls.map((call) => call[0] as Promise<unknown>));
 
-    expect(selfFetch).toHaveBeenCalledTimes(8);
-    expect(selfFetch.mock.calls.map((call) => new URL((call[0] as Request).url).pathname)).toEqual([
-      '/api/v1/internal/seed/sharded-public-snapshot',
-      '/api/v1/internal/seed/sharded-public-snapshot',
-      '/api/v1/internal/seed/sharded-public-snapshot',
-      '/api/v1/internal/seed/sharded-public-snapshot',
-      '/api/v1/internal/seed/sharded-public-snapshot',
-      '/api/v1/internal/seed/sharded-public-snapshot',
-      '/api/v1/internal/assemble/sharded-public-snapshot',
-      '/api/v1/internal/assemble/sharded-public-snapshot',
-    ]);
+    expect(selfFetch).toHaveBeenCalledTimes(1);
+    expect(new URL((selfFetch.mock.calls[0]?.[0] as Request).url).pathname).toBe(
+      '/api/v1/internal/continue/sharded-public-snapshot',
+    );
+    await expect((selfFetch.mock.calls[0]?.[0] as Request).json()).resolves.toEqual({
+      step: 'seed',
+      kind: 'homepage',
+      part: 'envelope',
+      monitor_offset: 0,
+      monitor_limit: 2,
+    });
     expect(logSpy).toHaveBeenCalledWith(
       'scheduled: homepage_refresh_skip reason=sharded_public_snapshots runtime_updates=0',
     );

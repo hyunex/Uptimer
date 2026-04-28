@@ -270,6 +270,116 @@ describe('internal sharded public snapshot assembler route', () => {
   });
 });
 
+describe('internal sharded public snapshot continuation route', () => {
+  it('is hidden unless the continuation flag is enabled', async () => {
+    const env = {
+      DB: createFakeD1Database([]),
+      ADMIN_TOKEN: 'test-admin-token',
+    } as unknown as Env;
+
+    const res = await worker.fetch(
+      new Request('http://internal/api/v1/internal/continue/sharded-public-snapshot', {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer test-admin-token',
+          'Content-Type': 'application/json; charset=utf-8',
+        },
+        body: JSON.stringify({ step: 'assemble', kind: 'homepage' }),
+      }),
+      env,
+      { waitUntil: vi.fn() } as unknown as ExecutionContext,
+    );
+
+    expect(res.status).toBe(404);
+  });
+
+  it('runs one bounded seed step and queues the next continuation', async () => {
+    const writes: unknown[][] = [];
+    const generatedAt = Math.floor(Date.now() / 1000);
+    const payload = { ...statusPayload(), generated_at: generatedAt };
+    const selfRequests: Request[] = [];
+    const waitUntil = vi.fn();
+    const env = {
+      DB: createFakeD1Database([
+        {
+          match: (sql) => sql.includes('from public_snapshots') && !sql.includes('body_json'),
+          first: () => ({ generated_at: payload.generated_at, updated_at: payload.generated_at }),
+        },
+        {
+          match: (sql) => sql.includes('from public_snapshots') && sql.includes('body_json'),
+          first: () => ({
+            generated_at: payload.generated_at,
+            updated_at: payload.generated_at,
+            body_json: JSON.stringify(payload),
+          }),
+        },
+        {
+          match: 'insert into public_snapshot_fragments',
+          run: (args) => {
+            writes.push(args);
+            return 1;
+          },
+        },
+      ]),
+      ADMIN_TOKEN: 'test-admin-token',
+      UPTIMER_SCHEDULED_SHARDED_CONTINUATION: '1',
+      UPTIMER_PUBLIC_SHARDED_FRAGMENT_SEED: '1',
+      UPTIMER_SCHEDULED_SHARDED_FRAGMENT_SEED: '1',
+      SELF: {
+        fetch: vi.fn(async (request: Request) => {
+          selfRequests.push(request);
+          return new Response(JSON.stringify({ ok: true }), { status: 200 });
+        }),
+      },
+    } as unknown as Env;
+
+    const res = await worker.fetch(
+      new Request('http://internal/api/v1/internal/continue/sharded-public-snapshot', {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer test-admin-token',
+          'Content-Type': 'application/json; charset=utf-8',
+        },
+        body: JSON.stringify({
+          step: 'seed',
+          kind: 'status',
+          part: 'monitors',
+          monitor_offset: 0,
+          monitor_limit: 1,
+        }),
+      }),
+      env,
+      { waitUntil } as unknown as ExecutionContext,
+    );
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toMatchObject({
+      ok: true,
+      step: 'seed',
+      seeded: true,
+      kind: 'status',
+      part: 'monitors',
+      monitor_count: 1,
+      monitor_offset: 0,
+      monitor_limit: 1,
+      write_count: 1,
+      continued: true,
+      next_step: { step: 'assemble', kind: 'homepage' },
+    });
+    expect(writes).toHaveLength(1);
+    expect(waitUntil).toHaveBeenCalledTimes(1);
+    await Promise.all(waitUntil.mock.calls.map((call) => call[0] as Promise<unknown>));
+    expect(selfRequests).toHaveLength(1);
+    expect(new URL(selfRequests[0]!.url).pathname).toBe(
+      '/api/v1/internal/continue/sharded-public-snapshot',
+    );
+    await expect(selfRequests[0]!.json()).resolves.toEqual({
+      step: 'assemble',
+      kind: 'homepage',
+    });
+  });
+});
+
 describe('internal sharded public snapshot fragment seed route', () => {
   it('is hidden unless the seed flag is enabled', async () => {
     const env = {
