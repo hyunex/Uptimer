@@ -63,6 +63,94 @@ function wantsRuntimeUpdateFragmentsOnly(request: Request): boolean {
   return normalizeTruthyHeader(request.headers.get('X-Uptimer-Runtime-Fragments-Only'));
 }
 
+function shouldLogInternalCheckBatchDiagnostics(env: Env): boolean {
+  return normalizeTruthyHeader(env.UPTIMER_INTERNAL_CHECK_BATCH_DIAGNOSTICS ?? null);
+}
+
+type InternalCheckBatchDiagnosticTimings = Record<string, number>;
+
+async function timeInternalCheckBatchDiagnostic<T>(
+  enabled: boolean,
+  timings: InternalCheckBatchDiagnosticTimings,
+  label: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  if (!enabled) {
+    return await fn();
+  }
+  const startedAt = performance.now();
+  try {
+    return await fn();
+  } finally {
+    timings[label] = performance.now() - startedAt;
+  }
+}
+
+function timeInternalCheckBatchDiagnosticSync<T>(
+  enabled: boolean,
+  timings: InternalCheckBatchDiagnosticTimings,
+  label: string,
+  fn: () => T,
+): T {
+  if (!enabled) {
+    return fn();
+  }
+  const startedAt = performance.now();
+  try {
+    return fn();
+  } finally {
+    timings[label] = performance.now() - startedAt;
+  }
+}
+
+function formatDiagnosticMs(value: number | undefined): string {
+  return (value ?? 0).toFixed(2);
+}
+
+function logInternalCheckBatchDiagnostics(opts: {
+  enabled: boolean;
+  timings: InternalCheckBatchDiagnosticTimings;
+  startedAt: number;
+  idCount: number;
+  runtimeFragmentsOnly: boolean;
+  fragmentWriteCount: number;
+  runtimeUpdateCount: number;
+  processedCount: number;
+  rejectedCount: number;
+  attemptTotal: number;
+  httpCount: number;
+  tcpCount: number;
+  checksDurMs: number;
+  persistDurMs: number;
+}): void {
+  if (!opts.enabled) return;
+  console.log(
+    [
+      'internal_check_batch',
+      `ids=${opts.idCount}`,
+      `runtime_fragments_only=${opts.runtimeFragmentsOnly ? 1 : 0}`,
+      `fragment_writes=${opts.fragmentWriteCount}`,
+      `runtime_updates=${opts.runtimeUpdateCount}`,
+      `processed=${opts.processedCount}`,
+      `rejected=${opts.rejectedCount}`,
+      `attempts=${opts.attemptTotal}`,
+      `http=${opts.httpCount}`,
+      `tcp=${opts.tcpCount}`,
+      `checks_ms=${opts.checksDurMs.toFixed(2)}`,
+      `persist_ms=${opts.persistDurMs.toFixed(2)}`,
+      `parse_ms=${formatDiagnosticMs(opts.timings.parse)}`,
+      `import_ms=${formatDiagnosticMs(opts.timings.imports)}`,
+      `notify_ms=${formatDiagnosticMs(opts.timings.notify)}`,
+      `run_ms=${formatDiagnosticMs(opts.timings.run)}`,
+      `fragment_import_ms=${formatDiagnosticMs(opts.timings.fragmentImports)}`,
+      `fragment_build_ms=${formatDiagnosticMs(opts.timings.fragmentBuild)}`,
+      `fragment_write_ms=${formatDiagnosticMs(opts.timings.fragmentWrite)}`,
+      `stringify_ms=${formatDiagnosticMs(opts.timings.stringify)}`,
+      `total_ms=${(performance.now() - opts.startedAt).toFixed(2)}`,
+    ].join(' '),
+  );
+}
+
 function buildInternalRefreshResponse(ok: boolean, refreshed: boolean): Response {
   return new Response(JSON.stringify({ ok, refreshed }), {
     status: ok ? 200 : 500,
@@ -642,6 +730,9 @@ async function handleInternalScheduledCheckBatch(
   ctx: ExecutionContext,
 ): Promise<Response> {
   const maxPastCheckedAtSkewSeconds = 5 * 60;
+  const diagnosticsEnabled = shouldLogInternalCheckBatchDiagnostics(env);
+  const diagnosticsStartedAt = diagnosticsEnabled ? performance.now() : 0;
+  const diagnosticsTimings: InternalCheckBatchDiagnosticTimings = {};
   if (!isInternalServiceRequest(request)) {
     return buildNotFoundJsonResponse(request.headers.get('Origin'));
   }
@@ -668,9 +759,18 @@ async function handleInternalScheduledCheckBatch(
   }
   trace?.setLabel('route', 'internal/scheduled-check-batch');
 
-  const rawBody = trace
-    ? await trace.timeAsync('check_batch_parse_body', async () => await request.json().catch(() => null))
-    : await request.json().catch(() => null);
+  const rawBody = await timeInternalCheckBatchDiagnostic(
+    diagnosticsEnabled,
+    diagnosticsTimings,
+    'parse',
+    async () =>
+      trace
+        ? await trace.timeAsync(
+            'check_batch_parse_body',
+            async () => await request.json().catch(() => null),
+          )
+        : await request.json().catch(() => null),
+  );
   const parsedBody = parseInternalScheduledCheckBatchBody(rawBody);
   if (!parsedBody) {
     return new Response('Forbidden', { status: 403 });
@@ -690,31 +790,43 @@ async function handleInternalScheduledCheckBatch(
 
   const ids = [...new Set(parsedBody.ids)];
   const suppressedMonitorIds = new Set(parsedBody.suppressed_monitor_ids ?? []);
-  const [{ runExclusivePersistedMonitorBatch }, notificationsModule] = await (trace
-    ? trace.timeAsync(
-        'check_batch_import_modules',
-        async () =>
-          await Promise.all([
+  const [{ runExclusivePersistedMonitorBatch }, notificationsModule] = await timeInternalCheckBatchDiagnostic(
+    diagnosticsEnabled,
+    diagnosticsTimings,
+    'imports',
+    async () =>
+      await (trace
+        ? trace.timeAsync(
+            'check_batch_import_modules',
+            async () =>
+              await Promise.all([
+                import('./scheduler/scheduled'),
+                parsedBody.allow_notifications === true
+                  ? import('./scheduler/notifications')
+                  : Promise.resolve(null),
+              ]),
+          )
+        : Promise.all([
             import('./scheduler/scheduled'),
             parsedBody.allow_notifications === true
               ? import('./scheduler/notifications')
               : Promise.resolve(null),
-          ]),
-      )
-    : Promise.all([
-        import('./scheduler/scheduled'),
-        parsedBody.allow_notifications === true
-          ? import('./scheduler/notifications')
-          : Promise.resolve(null),
-      ]));
+          ])),
+  );
 
   const notify = notificationsModule
-    ? trace
-      ? await trace.timeAsync(
-          'check_batch_notify_context',
-          async () => await notificationsModule.createNotifyContext(env, ctx),
-        )
-      : await notificationsModule.createNotifyContext(env, ctx)
+    ? await timeInternalCheckBatchDiagnostic(
+        diagnosticsEnabled,
+        diagnosticsTimings,
+        'notify',
+        async () =>
+          trace
+            ? await trace.timeAsync(
+                'check_batch_notify_context',
+                async () => await notificationsModule.createNotifyContext(env, ctx),
+              )
+            : await notificationsModule.createNotifyContext(env, ctx),
+      )
     : null;
   let result;
   try {
@@ -737,7 +849,12 @@ async function handleInternalScheduledCheckBatch(
           : {}),
         ...(trace ? { trace } : {}),
       });
-    result = trace ? await trace.timeAsync('check_batch_run', runBatch) : await runBatch();
+    result = await timeInternalCheckBatchDiagnostic(
+      diagnosticsEnabled,
+      diagnosticsTimings,
+      'run',
+      async () => (trace ? await trace.timeAsync('check_batch_run', runBatch) : await runBatch()),
+    );
   } catch (err) {
     if (err instanceof LeaseLostError) {
       console.warn(err.message);
@@ -764,12 +881,26 @@ async function handleInternalScheduledCheckBatch(
   );
   const runtimeFragmentsOnly =
     monitorUpdateFragmentWritesEnabled && wantsRuntimeUpdateFragmentsOnly(request);
+  let fragmentWriteCount = 0;
   if (monitorUpdateFragmentWritesEnabled) {
-    const { buildMonitorRuntimeUpdateFragmentWrites } = await import(
-      './snapshots/public-monitor-fragments'
+    const [{ buildMonitorRuntimeUpdateFragmentWrites }, { writePublicSnapshotFragments }] =
+      await timeInternalCheckBatchDiagnostic(
+        diagnosticsEnabled,
+        diagnosticsTimings,
+        'fragmentImports',
+        async () =>
+          await Promise.all([
+            import('./snapshots/public-monitor-fragments'),
+            import('./snapshots/public-fragments'),
+          ]),
+      );
+    const fragmentWrites = timeInternalCheckBatchDiagnosticSync(
+      diagnosticsEnabled,
+      diagnosticsTimings,
+      'fragmentBuild',
+      () => buildMonitorRuntimeUpdateFragmentWrites(result.runtimeUpdates, now),
     );
-    const { writePublicSnapshotFragments } = await import('./snapshots/public-fragments');
-    const fragmentWrites = buildMonitorRuntimeUpdateFragmentWrites(result.runtimeUpdates, now);
+    fragmentWriteCount = fragmentWrites.length;
     if (trace?.enabled) {
       trace.setLabel('monitor_update_fragment_write_count', fragmentWrites.length);
       trace.setLabel('runtime_updates_fragmented', runtimeFragmentsOnly ? 1 : 0);
@@ -780,7 +911,12 @@ async function handleInternalScheduledCheckBatch(
           console.warn('internal scheduled check batch: monitor update fragment write failed', err);
         });
       if (runtimeFragmentsOnly) {
-        await writeFragments();
+        await timeInternalCheckBatchDiagnostic(
+          diagnosticsEnabled,
+          diagnosticsTimings,
+          'fragmentWrite',
+          writeFragments,
+        );
       } else {
         ctx.waitUntil(writeFragments());
       }
@@ -805,9 +941,31 @@ async function handleInternalScheduledCheckBatch(
     checks_duration_ms: result.checksDurMs,
     persist_duration_ms: result.persistDurMs,
   };
-  const bodyText = trace
-    ? trace.time('check_batch_stringify_response', () => JSON.stringify(responsePayload))
-    : JSON.stringify(responsePayload);
+  const bodyText = timeInternalCheckBatchDiagnosticSync(
+    diagnosticsEnabled,
+    diagnosticsTimings,
+    'stringify',
+    () =>
+      trace
+        ? trace.time('check_batch_stringify_response', () => JSON.stringify(responsePayload))
+        : JSON.stringify(responsePayload),
+  );
+  logInternalCheckBatchDiagnostics({
+    enabled: diagnosticsEnabled,
+    timings: diagnosticsTimings,
+    startedAt: diagnosticsStartedAt,
+    idCount: ids.length,
+    runtimeFragmentsOnly,
+    fragmentWriteCount,
+    runtimeUpdateCount: result.runtimeUpdates.length,
+    processedCount: result.stats.processedCount,
+    rejectedCount: result.stats.rejectedCount,
+    attemptTotal: result.stats.attemptTotal,
+    httpCount: result.stats.httpCount,
+    tcpCount: result.stats.tcpCount,
+    checksDurMs: result.checksDurMs,
+    persistDurMs: result.persistDurMs,
+  });
   return finalizeInternalCheckBatchResponse(new Response(
     bodyText,
     {
