@@ -134,6 +134,11 @@ function shouldWriteHomepageArtifactFragments(env: Env): boolean {
   return isTruthyEnvFlag(raw);
 }
 
+function shouldSeedHomepageFromRuntimeSnapshot(env: Env): boolean {
+  const raw = (env as unknown as Record<string, unknown>).UPTIMER_PUBLIC_SHARDED_HOMEPAGE_RUNTIME_SEED;
+  return isTruthyEnvFlag(raw);
+}
+
 const RAW_PUBLIC_SNAPSHOT_FUTURE_TOLERANCE_SECONDS = 60;
 const READ_RAW_PUBLIC_SNAPSHOT_SQL = `
   SELECT generated_at, body_json
@@ -482,7 +487,28 @@ async function readHomepageSeedPayload(
   now: number,
 ): Promise<PublicHomepageResponse | null> {
   const { readHomepageRefreshBaseSnapshot } = await import('../snapshots/public-homepage-read');
-  return (await readHomepageRefreshBaseSnapshot(env.DB, now)).snapshot;
+  const base = await readHomepageRefreshBaseSnapshot(env.DB, now);
+  if (!base.snapshot || !shouldSeedHomepageFromRuntimeSnapshot(env)) {
+    return base.snapshot;
+  }
+
+  try {
+    const { tryComputePublicHomepagePayloadFromScheduledRuntimeUpdates } = await import(
+      '../public/homepage'
+    );
+    return (
+      await tryComputePublicHomepagePayloadFromScheduledRuntimeUpdates({
+        db: env.DB,
+        now,
+        baseSnapshot: base.snapshot,
+        baseSnapshotBodyJson: null,
+        updates: [],
+      })
+    ) ?? base.snapshot;
+  } catch (err) {
+    console.warn('internal sharded homepage runtime seed failed', err);
+    return base.snapshot;
+  }
 }
 
 async function readStatusSeedPayload(
